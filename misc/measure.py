@@ -23,8 +23,6 @@ import time
 import subprocess
 import sys
 
-devnull = open('/dev/null', 'w')
-
 def run(cmd, repeat=10):
     print('sampling:', end=' ')
     sys.stdout.flush()
@@ -32,7 +30,7 @@ def run(cmd, repeat=10):
     samples = []
     for _ in range(repeat):
         start = time.time()
-        subprocess.call(cmd, stdout=devnull, stderr=devnull)
+        subprocess.call(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         end = time.time()
         dt = (end - start) * 1000
         print('%dms' % int(dt), end=' ')

@@ -354,7 +354,7 @@ else:
         proc = subprocess.Popen(
             [CXX, '-fdiagnostics-color', '-c', '-x', 'c++', '/dev/null',
              '-o', '/dev/null'],
-            stdout=open(os.devnull, 'wb'), stderr=subprocess.STDOUT)
+            stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
         if proc.wait() == 0:
             cflags += ['-fdiagnostics-color']
     except:
