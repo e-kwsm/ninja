@@ -19,25 +19,25 @@
 
 from __future__ import print_function
 
+import os
 import time
 import subprocess
 import sys
-
-devnull = open('/dev/null', 'w')
 
 def run(cmd, repeat=10):
     print('sampling:', end=' ')
     sys.stdout.flush()
 
     samples = []
-    for _ in range(repeat):
-        start = time.time()
-        subprocess.call(cmd, stdout=devnull, stderr=devnull)
-        end = time.time()
-        dt = (end - start) * 1000
-        print('%dms' % int(dt), end=' ')
-        sys.stdout.flush()
-        samples.append(dt)
+    with open(os.devnull, 'w') as devnull:
+        for _ in range(repeat):
+            start = time.time()
+            subprocess.call(cmd, stdout=devnull, stderr=devnull)
+            end = time.time()
+            dt = (end - start) * 1000
+            print('%dms' % int(dt), end=' ')
+            sys.stdout.flush()
+            samples.append(dt)
     print()
 
     # We're interested in the 'pure' runtime of the code, which is
