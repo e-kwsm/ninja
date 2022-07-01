@@ -374,7 +374,7 @@ else:
 libs = []
 
 if platform.is_mingw():
-    cflags.remove('-fvisibility=hidden');
+    cflags.remove('-fvisibility=hidden')
     ldflags.append('-static')
 elif platform.is_solaris():
     cflags.remove('-fvisibility=hidden')
