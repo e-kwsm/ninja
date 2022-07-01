@@ -404,7 +404,7 @@ def shell_escape(str):
 
     # This isn't complete, but it's just enough to make NINJA_PYTHON work.
     if platform.is_windows():
-      return str
+        return str
     if '"' in str:
         return "'%s'" % str.replace("'", "\\'")
     return str
@@ -617,10 +617,10 @@ for name in ['build_log_perftest',
              'hash_collision_bench',
              'manifest_parser_perftest',
              'clparser_perftest']:
-  if platform.is_msvc():
-    cxxvariables = [('pdb', name + '.pdb')]
-  objs = cxx(name, variables=cxxvariables)
-  all_targets += n.build(binary(name), 'link', objs,
+    if platform.is_msvc():
+        cxxvariables = [('pdb', name + '.pdb')]
+    objs = cxx(name, variables=cxxvariables)
+    all_targets += n.build(binary(name), 'link', objs,
                          implicit=ninja_lib, variables=[('libs', libs)])
 
 n.newline()

@@ -108,10 +108,10 @@ class Target(object):
 def write_target_ninja(ninja, target, src_dir):
     compile_depends = None
     if target.has_compile_depends:
-      compile_depends = os.path.join(
-          'obj', target.dir_path, target.name + '.stamp')
-      ninja.build(compile_depends, 'stamp', target.src_obj_pairs[0][0])
-      ninja.newline()
+        compile_depends = os.path.join(
+            'obj', target.dir_path, target.name + '.stamp')
+        ninja.build(compile_depends, 'stamp', target.src_obj_pairs[0][0])
+        ninja.newline()
 
     ninja.variable('defines', target.defines)
     ninja.variable('includes', '-I' + src_dir)
