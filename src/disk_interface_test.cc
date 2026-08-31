@@ -17,6 +17,7 @@
 #ifdef _WIN32
 #include <io.h>
 #include <windows.h>
+#include <direct.h>
 #endif
 
 #include "disk_interface.h"
@@ -65,6 +66,17 @@ TEST_F(DiskInterfaceTest, StatMissingFile) {
   EXPECT_EQ("", err);
 }
 
+TEST_F(DiskInterfaceTest, StatMissingFileWithCache) {
+  disk_.AllowStatCache(true);
+  string err;
+
+  // On Windows, the errno for FindFirstFileExA, which is used when the stat
+  // cache is enabled, is different when the directory name is not a directory.
+  ASSERT_TRUE(Touch("notadir"));
+  EXPECT_EQ(0, disk_.Stat("notadir/nosuchfile", &err));
+  EXPECT_EQ("", err);
+}
+
 TEST_F(DiskInterfaceTest, StatBadPath) {
   string err;
 #ifdef _WIN32
@@ -83,6 +95,45 @@ TEST_F(DiskInterfaceTest, StatExistingFile) {
   ASSERT_TRUE(Touch("file"));
   EXPECT_GT(disk_.Stat("file", &err), 1);
   EXPECT_EQ("", err);
+}
+
+#ifdef _WIN32
+TEST_F(DiskInterfaceTest, StatExistingFileWithLongPath) {
+  string err;
+  char currentdir[32767];
+  _getcwd(currentdir, sizeof(currentdir));
+  const string filename = string(currentdir) +
+"\\filename_with_256_characters_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\
+xxxxxxxxxxxxxxxxxxxxx";
+  const string prefixed = "\\\\?\\" + filename;
+  ASSERT_TRUE(Touch(prefixed.c_str()));
+  EXPECT_GT(disk_.Stat(disk_.AreLongPathsEnabled() ?
+    filename : prefixed, &err), 1);
+  EXPECT_EQ("", err);
+}
+#endif
+
+TEST_F(DiskInterfaceTest, StatSymlink) {
+  string err;
+
+  ASSERT_TRUE(Touch("file"));
+  auto fileTimeStamp = disk_.Stat("file", &err);
+  EXPECT_EQ("", err);
+
+#ifdef _WIN32
+  // Create a symlink to file
+  ASSERT_TRUE(CreateSymbolicLinkA(
+      "fileSymlink", "file", SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE));
+#else
+  ASSERT_TRUE(symlink("file", "fileSymlink") == 0);
+#endif
+
+  // Assert that stating the symlink will resolve the timestamp for the
+  // linked file.
+  auto symlinkTimeStamp = disk_.Stat("fileSymlink", &err);
+  ASSERT_EQ(fileTimeStamp, symlinkTimeStamp);
 }
 
 TEST_F(DiskInterfaceTest, StatExistingDir) {
@@ -229,23 +280,24 @@ TEST_F(DiskInterfaceTest, RemoveDirectory) {
 
 struct StatTest : public StateTestWithBuiltinRules,
                   public DiskInterface {
-  StatTest() : scan_(&state_, NULL, NULL, this, NULL) {}
+  StatTest() : scan_(&state_, NULL, NULL, this, NULL, NULL) {}
 
   // DiskInterface implementation.
-  virtual TimeStamp Stat(const string& path, string* err) const;
-  virtual bool WriteFile(const string& path, const string& contents) {
+  TimeStamp Stat(const string& path, string* err) const override;
+  bool WriteFile(const string& path, const string& contents,
+                 bool /*crlf_on_windows*/) override {
     assert(false);
     return true;
   }
-  virtual bool MakeDir(const string& path) {
+  bool MakeDir(const string& path) override {
     assert(false);
     return false;
   }
-  virtual Status ReadFile(const string& path, string* contents, string* err) {
+  Status ReadFile(const string& path, string* contents, string* err) override {
     assert(false);
     return NotFound;
   }
-  virtual int RemoveFile(const string& path) {
+  int RemoveFile(const string& path) override {
     assert(false);
     return 0;
   }
@@ -291,10 +343,10 @@ TEST_F(StatTest, TwoStep) {
   scan_.RecomputeDirty(out, NULL, NULL);
   ASSERT_EQ(3u, stats_.size());
   ASSERT_EQ("out", stats_[0]);
-  ASSERT_TRUE(GetNode("out")->dirty());
-  ASSERT_EQ("mid",  stats_[1]);
-  ASSERT_TRUE(GetNode("mid")->dirty());
+  ASSERT_EQ("mid", stats_[1]);
   ASSERT_EQ("in",  stats_[2]);
+  ASSERT_TRUE(GetNode("out")->dirty());
+  ASSERT_TRUE(GetNode("mid")->dirty());
 }
 
 TEST_F(StatTest, Tree) {
@@ -311,8 +363,9 @@ TEST_F(StatTest, Tree) {
   scan_.RecomputeDirty(out, NULL, NULL);
   ASSERT_EQ(1u + 6u, stats_.size());
   ASSERT_EQ("mid1", stats_[1]);
-  ASSERT_TRUE(GetNode("mid1")->dirty());
   ASSERT_EQ("in11", stats_[2]);
+  ASSERT_EQ("in12", stats_[3]);
+  ASSERT_TRUE(GetNode("mid1")->dirty());
 }
 
 TEST_F(StatTest, Middle) {

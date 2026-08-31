@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 
 # Copyright 2011 Google Inc. All Rights Reserved.
 #
@@ -17,15 +17,14 @@
 """measure the runtime of a command by repeatedly running it.
 """
 
-from __future__ import print_function
-
 import time
 import subprocess
 import sys
+from typing import Union, List
 
 devnull = open('/dev/null', 'w')
 
-def run(cmd, repeat=10):
+def run(cmd: Union[str, List[str]], repeat: int = 10) -> None:
     print('sampling:', end=' ')
     sys.stdout.flush()
 

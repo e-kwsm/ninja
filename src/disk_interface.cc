@@ -23,9 +23,10 @@
 #include <sys/types.h>
 
 #ifdef _WIN32
-#include <sstream>
-#include <windows.h>
 #include <direct.h>  // _mkdir
+#include <windows.h>
+
+#include <sstream>
 #else
 #include <unistd.h>
 #endif
@@ -82,6 +83,33 @@ TimeStamp StatSingleFile(const string& path, string* err) {
     *err = "GetFileAttributesEx(" + path + "): " + GetLastErrorString();
     return -1;
   }
+
+  if (attrs.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) {
+    HANDLE hFile = CreateFileA(path.c_str(), 0, 0, 0, OPEN_EXISTING,
+                               FILE_FLAG_BACKUP_SEMANTICS, 0);
+    if (hFile == INVALID_HANDLE_VALUE) {
+      DWORD win_err = GetLastError();
+      if (win_err == ERROR_FILE_NOT_FOUND || win_err == ERROR_PATH_NOT_FOUND)
+        return 0;
+      *err = "CreateFileA(" + path + "): " + GetLastErrorString();
+      CloseHandle(hFile);
+      return -1;
+    }
+
+    CHAR pathBuf[MAX_PATH];
+    if (GetFinalPathNameByHandleA(hFile, pathBuf, MAX_PATH,
+                                  FILE_NAME_NORMALIZED) == 0) {
+      DWORD win_err = GetLastError();
+      if (win_err == ERROR_FILE_NOT_FOUND || win_err == ERROR_PATH_NOT_FOUND)
+        return 0;
+      *err = "GetFinalPathNameByHandleA(" + path + "): " + GetLastErrorString();
+      CloseHandle(hFile);
+      return -1;
+    }
+    CloseHandle(hFile);
+    return StatSingleFile(pathBuf, err);
+  }
+
   return TimeStampFromFileTime(attrs.ftLastWriteTime);
 }
 
@@ -110,7 +138,8 @@ bool StatAllFilesInDir(const string& dir, map<string, TimeStamp>* stamps,
 
   if (find_handle == INVALID_HANDLE_VALUE) {
     DWORD win_err = GetLastError();
-    if (win_err == ERROR_FILE_NOT_FOUND || win_err == ERROR_PATH_NOT_FOUND)
+    if (win_err == ERROR_FILE_NOT_FOUND || win_err == ERROR_PATH_NOT_FOUND ||
+        win_err == ERROR_DIRECTORY)
       return true;
     *err = "FindFirstFileExA(" + dir + "): " + GetLastErrorString();
     return false;
@@ -122,9 +151,18 @@ bool StatAllFilesInDir(const string& dir, map<string, TimeStamp>* stamps,
       // This is the case at least on NTFS under Windows 7.
       continue;
     }
+
     transform(lowername.begin(), lowername.end(), lowername.begin(), ::tolower);
-    stamps->insert(make_pair(lowername,
-                             TimeStampFromFileTime(ffd.ftLastWriteTime)));
+
+    if (ffd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) {
+      // File is a symlink, stat the linked file.
+      stamps->insert(make_pair(
+          lowername, StatSingleFile(dir + "\\" + ffd.cFileName, err)));
+    } else {
+      stamps->insert(
+          make_pair(lowername, TimeStampFromFileTime(ffd.ftLastWriteTime)));
+    }
+
   } while (FindNextFileA(find_handle, &ffd));
   FindClose(find_handle);
   return true;
@@ -156,13 +194,31 @@ bool DiskInterface::MakeDirs(const string& path) {
 }
 
 // RealDiskInterface -----------------------------------------------------------
+RealDiskInterface::RealDiskInterface()
+#ifdef _WIN32
+: use_cache_(false), long_paths_enabled_(false) {
+  // Probe ntdll.dll for RtlAreLongPathsEnabled, and call it if it exists.
+  HINSTANCE ntdll_lib = ::GetModuleHandleW(L"ntdll");
+  if (ntdll_lib) {
+    typedef BOOLEAN(WINAPI FunctionType)();
+    auto* func_ptr = FunctionCast<FunctionType*>(
+        ::GetProcAddress(ntdll_lib, "RtlAreLongPathsEnabled"));
+    if (func_ptr) {
+      long_paths_enabled_ = (*func_ptr)();
+    }
+  }
+}
+#else
+{}
+#endif
 
 TimeStamp RealDiskInterface::Stat(const string& path, string* err) const {
   METRIC_RECORD("node stat");
 #ifdef _WIN32
   // MSDN: "Naming Files, Paths, and Namespaces"
   // http://msdn.microsoft.com/en-us/library/windows/desktop/aa365247(v=vs.85).aspx
-  if (!path.empty() && path[0] != '\\' && path.size() > MAX_PATH) {
+  if (!path.empty() && !AreLongPathsEnabled() && path[0] != '\\' &&
+      path.size() > MAX_PATH) {
     ostringstream err_stream;
     err_stream << "Stat(" << path << "): Filename longer than " << MAX_PATH
                << " characters";
@@ -225,8 +281,15 @@ TimeStamp RealDiskInterface::Stat(const string& path, string* err) const {
 #endif
 }
 
-bool RealDiskInterface::WriteFile(const string& path, const string& contents) {
-  FILE* fp = fopen(path.c_str(), "w");
+bool RealDiskInterface::WriteFile(const string& path, const string& contents,
+                                  bool crlf_on_windows) {
+  FILE* fp = fopen(path.c_str(),
+#ifdef _WIN32
+                   crlf_on_windows ? "w" : "wb");
+#else
+                   "wb");
+  (void)crlf_on_windows;
+#endif
   if (fp == NULL) {
     Error("WriteFile(%s): Unable to create file. %s",
           path.c_str(), strerror(errno));
@@ -286,7 +349,7 @@ int RealDiskInterface::RemoveFile(const string& path) {
     SetFileAttributesA(path.c_str(), attributes & ~FILE_ATTRIBUTE_READONLY);
   }
   if (attributes & FILE_ATTRIBUTE_DIRECTORY) {
-    // remove() deletes both files and directories. On Windows we have to 
+    // remove() deletes both files and directories. On Windows we have to
     // select the correct function (DeleteFile will yield Permission Denied when
     // used on a directory)
     // This fixes the behavior of ninja -t clean in some cases
@@ -332,3 +395,9 @@ void RealDiskInterface::AllowStatCache(bool allow) {
     cache_.clear();
 #endif
 }
+
+#ifdef _WIN32
+bool RealDiskInterface::AreLongPathsEnabled(void) const {
+  return long_paths_enabled_;
+}
+#endif

@@ -20,6 +20,8 @@
 
 #include <algorithm>
 #include <cstdlib>
+#include <cstring>
+#include <string>
 
 #ifdef _WIN32
 #include "getopt.h"
@@ -36,13 +38,15 @@
 #include "browse.h"
 #include "build.h"
 #include "build_log.h"
-#include "deps_log.h"
 #include "clean.h"
+#include "command_collector.h"
 #include "debug_flags.h"
-#include "depfile_parser.h"
+#include "deps_log.h"
 #include "disk_interface.h"
+#include "exit_status.h"
 #include "graph.h"
 #include "graphviz.h"
+#include "jobserver.h"
 #include "json.h"
 #include "manifest_parser.h"
 #include "metrics.h"
@@ -76,9 +80,6 @@ struct Options {
 
   /// Tool to run rather than building.
   const Tool* tool;
-
-  /// Whether duplicate rules for one target should warn or print an error.
-  bool dupe_edges_should_err;
 
   /// Whether phony cycles should warn or print an error.
   bool phony_cycle_should_err;
@@ -130,9 +131,12 @@ struct NinjaMain : public BuildLogUser {
   int ToolTargets(const Options* options, int argc, char* argv[]);
   int ToolCommands(const Options* options, int argc, char* argv[]);
   int ToolInputs(const Options* options, int argc, char* argv[]);
+  int ToolMultiInputs(const Options* options, int argc, char* argv[]);
   int ToolClean(const Options* options, int argc, char* argv[]);
   int ToolCleanDead(const Options* options, int argc, char* argv[]);
   int ToolCompilationDatabase(const Options* options, int argc, char* argv[]);
+  int ToolCompilationDatabaseForTargets(const Options* options, int argc,
+                                        char* argv[]);
   int ToolRecompact(const Options* options, int argc, char* argv[]);
   int ToolRestat(const Options* options, int argc, char* argv[]);
   int ToolUrtle(const Options* options, int argc, char** argv);
@@ -156,9 +160,17 @@ struct NinjaMain : public BuildLogUser {
   /// @return true if the manifest was rebuilt.
   bool RebuildManifest(const char* input_file, string* err, Status* status);
 
+  /// For each edge, lookup in build log how long it took last time,
+  /// and record that in the edge itself. It will be used for ETA prediction.
+  void ParsePreviousElapsedTimes();
+
+  /// Create a jobserver client if needed. Return a nullptr value if
+  /// not. Prints info and warnings to \a status.
+  std::unique_ptr<Jobserver::Client> SetupJobserverClient(Status* status);
+
   /// Build the targets listed on the command line.
   /// @return an exit code.
-  int RunBuild(int argc, char** argv, Status* status);
+  ExitStatus RunBuild(int argc, char** argv, Status* status);
 
   /// Dump the output requested by '-d stats'.
   void DumpMetrics();
@@ -222,6 +234,8 @@ void Usage(const BuildConfig& config) {
 "  --version      print ninja version (\"%s\")\n"
 "  -v, --verbose  show all command lines while building\n"
 "  --quiet        don't show progress status, just command output\n"
+"  --status FMT   progress status format using Ninja-style $vars\n"
+"                 (e.g. --status '[$finished/$total] ')\n"
 "\n"
 "  -C DIR   change to DIR before doing anything else\n"
 "  -f FILE  specify input build file [default=build.ninja]\n"
@@ -274,7 +288,7 @@ bool NinjaMain::RebuildManifest(const char* input_file, string* err,
   if (builder.AlreadyUpToDate())
     return false;  // Not an error, but we didn't rebuild.
 
-  if (!builder.Build(err))
+  if (builder.Build(err) != ExitSuccess)
     return false;
 
   // The manifest was only rebuilt if it is now dirty (it may have been cleaned
@@ -287,6 +301,19 @@ bool NinjaMain::RebuildManifest(const char* input_file, string* err,
   }
 
   return true;
+}
+
+void NinjaMain::ParsePreviousElapsedTimes() {
+  for (Edge* edge : state_.edges_) {
+    for (Node* out : edge->outputs_) {
+      BuildLog::LogEntry* log_entry = build_log_.LookupByOutput(out->path());
+      if (!log_entry)
+        continue;  // Maybe we'll have log entry for next output of this edge?
+      edge->prev_elapsed_time_millis =
+          log_entry->end_time - log_entry->start_time;
+      break;  // Onto next edge.
+    }
+  }
 }
 
 Node* NinjaMain::CollectTarget(const char* cpath, string* err) {
@@ -306,6 +333,18 @@ Node* NinjaMain::CollectTarget(const char* cpath, string* err) {
   }
 
   Node* node = state_.LookupNode(path);
+  if (!node && !build_dir_.empty()) {
+    // if 'foo' is not found, try to fallback to $build_dir/foo when build_dir
+    // is set in the manifest
+    std::string builddir_path = build_dir_ + "/" + path;
+    uint64_t builddir_slash_bits;
+    CanonicalizePath(&builddir_path, &builddir_slash_bits);
+    node = state_.LookupNode(builddir_path);
+    if (node) {
+      path = builddir_path;
+      slash_bits = builddir_slash_bits;
+    }
+  }
   if (node) {
     if (first_dependent) {
       if (node->out_edges().empty()) {
@@ -660,18 +699,17 @@ int NinjaMain::ToolRules(const Options* options, int argc, char* argv[]) {
 
   // Print rules
 
-  typedef map<string, const Rule*> Rules;
-  const Rules& rules = state_.bindings_.GetRules();
-  for (Rules::const_iterator i = rules.begin(); i != rules.end(); ++i) {
-    printf("%s", i->first.c_str());
+  for (const auto& r : state_.bindings_.GetRules()) {
+    printf("%s", r.first.c_str());
     if (print_description) {
-      const Rule* rule = i->second;
+      const Rule* rule = r.second.get();
       const EvalString* description = rule->GetBinding("description");
       if (description != NULL) {
         printf(": %s", description->Unparse().c_str());
       }
     }
     printf("\n");
+    fflush(stdout);
   }
   return 0;
 }
@@ -746,43 +784,50 @@ int NinjaMain::ToolCommands(const Options* options, int argc, char* argv[]) {
   return 0;
 }
 
-void CollectInputs(Edge* edge, std::set<Edge*>* seen,
-                   std::vector<std::string>* result) {
-  if (!edge)
-    return;
-  if (!seen->insert(edge).second)
-    return;
-
-  for (vector<Node*>::iterator in = edge->inputs_.begin();
-       in != edge->inputs_.end(); ++in)
-    CollectInputs((*in)->in_edge(), seen, result);
-
-  if (!edge->is_phony()) {
-    edge->CollectInputs(true, result);
-  }
-}
-
 int NinjaMain::ToolInputs(const Options* options, int argc, char* argv[]) {
   // The inputs tool uses getopt, and expects argv[0] to contain the name of
   // the tool, i.e. "inputs".
   argc++;
   argv--;
+
+  bool print0 = false;
+  bool shell_escape = true;
+  bool dependency_order = false;
+
   optind = 1;
   int opt;
   const option kLongOptions[] = { { "help", no_argument, NULL, 'h' },
+                                  { "no-shell-escape", no_argument, NULL, 'E' },
+                                  { "print0", no_argument, NULL, '0' },
+                                  { "dependency-order", no_argument, NULL,
+                                    'd' },
                                   { NULL, 0, NULL, 0 } };
-  while ((opt = getopt_long(argc, argv, "h", kLongOptions, NULL)) != -1) {
+  while ((opt = getopt_long(argc, argv, "h0Ed", kLongOptions, NULL)) != -1) {
     switch (opt) {
+    case 'd':
+      dependency_order = true;
+      break;
+    case 'E':
+      shell_escape = false;
+      break;
+    case '0':
+      print0 = true;
+      break;
     case 'h':
     default:
       // clang-format off
       printf(
 "Usage '-t inputs [options] [targets]\n"
 "\n"
-"List all inputs used for a set of targets. Note that this includes\n"
-"explicit, implicit and order-only inputs, but not validation ones.\n\n"
+"List all inputs used for a set of targets, sorted in dependency order.\n"
+"Note that by default, results are shell escaped, and sorted alphabetically,\n"
+"and never include validation target paths.\n\n"
 "Options:\n"
-"  -h, --help   Print this message.\n");
+"  -h, --help          Print this message.\n"
+"  -0, --print0            Use \\0, instead of \\n as a line terminator.\n"
+"  -E, --no-shell-escape   Do not shell escape the result.\n"
+"  -d, --dependency-order  Sort results by dependency order.\n"
+      );
       // clang-format on
       return 1;
     }
@@ -790,24 +835,98 @@ int NinjaMain::ToolInputs(const Options* options, int argc, char* argv[]) {
   argv += optind;
   argc -= optind;
 
-  vector<Node*> nodes;
-  string err;
+  std::vector<Node*> nodes;
+  std::string err;
   if (!CollectTargetsFromArgs(argc, argv, &nodes, &err)) {
     Error("%s", err.c_str());
     return 1;
   }
 
-  std::set<Edge*> seen;
-  std::vector<std::string> result;
-  for (vector<Node*>::iterator in = nodes.begin(); in != nodes.end(); ++in)
-    CollectInputs((*in)->in_edge(), &seen, &result);
+  InputsCollector collector;
+  for (const Node* node : nodes)
+    collector.VisitNode(node);
 
-  // Make output deterministic by sorting then removing duplicates.
-  std::sort(result.begin(), result.end());
-  result.erase(std::unique(result.begin(), result.end()), result.end());
+  std::vector<std::string> inputs = collector.GetInputsAsStrings(shell_escape);
+  if (!dependency_order)
+    std::sort(inputs.begin(), inputs.end());
 
-  for (size_t n = 0; n < result.size(); ++n)
-    puts(result[n].c_str());
+  if (print0) {
+    for (const std::string& input : inputs) {
+      fwrite(input.c_str(), input.size(), 1, stdout);
+      fputc('\0', stdout);
+    }
+    fflush(stdout);
+  } else {
+    for (const std::string& input : inputs)
+      puts(input.c_str());
+  }
+  return 0;
+}
+
+int NinjaMain::ToolMultiInputs(const Options* options, int argc, char* argv[]) {
+  // The inputs tool uses getopt, and expects argv[0] to contain the name of
+  // the tool, i.e. "inputs".
+  argc++;
+  argv--;
+
+  optind = 1;
+  int opt;
+  char terminator = '\n';
+  const char* delimiter = "\t";
+  const option kLongOptions[] = { { "help", no_argument, NULL, 'h' },
+                                  { "delimiter", required_argument, NULL,
+                                    'd' },
+                                  { "print0", no_argument, NULL, '0' },
+                                  { NULL, 0, NULL, 0 } };
+  while ((opt = getopt_long(argc, argv, "d:h0", kLongOptions, NULL)) != -1) {
+    switch (opt) {
+    case 'd':
+      delimiter = optarg;
+      break;
+    case '0':
+      terminator = '\0';
+      break;
+    case 'h':
+    default:
+      // clang-format off
+      printf(
+"Usage '-t multi-inputs [options] [targets]\n"
+"\n"
+"Print one or more sets of inputs required to build targets, sorted in dependency order.\n"
+"The tool works like inputs tool but with addition of the target for each line.\n"
+"The output will be a series of lines with the following elements:\n"
+"<target> <delimiter> <input> <terminator>\n"
+"Note that a given input may appear for several targets if it is used by more than one targets.\n"
+"Options:\n"
+"  -h, --help                   Print this message.\n"
+"  -d  --delimiter=DELIM        Use DELIM instead of TAB for field delimiter.\n"
+"  -0, --print0                 Use \\0, instead of \\n as a line terminator.\n"
+      );
+      // clang-format on
+      return 1;
+    }
+  }
+  argv += optind;
+  argc -= optind;
+
+  std::vector<Node*> nodes;
+  std::string err;
+  if (!CollectTargetsFromArgs(argc, argv, &nodes, &err)) {
+    Error("%s", err.c_str());
+    return 1;
+  }
+
+  for (const Node* node : nodes) {
+    InputsCollector collector;
+
+    collector.VisitNode(node);
+    std::vector<std::string> inputs = collector.GetInputsAsStrings();
+
+    for (const std::string& input : inputs) {
+      printf("%s%s%s", node->path().c_str(), delimiter, input.c_str());
+      fputc(terminator, stdout);
+    }
+  }
 
   return 0;
 }
@@ -881,7 +1000,10 @@ std::string EvaluateCommandWithRspfile(const Edge* edge,
     return command;
 
   size_t index = command.find(rspfile);
-  if (index == 0 || index == string::npos || command[index - 1] != '@')
+  if (index == 0 || index == string::npos ||
+      (command[index - 1] != '@' &&
+       command.find("--option-file=") != index - 14 &&
+       command.find("-f ") != index - 3))
     return command;
 
   string rspfile_content = edge->GetBinding("rspfile_content");
@@ -891,21 +1013,49 @@ std::string EvaluateCommandWithRspfile(const Edge* edge,
     rspfile_content.replace(newline_index, 1, 1, ' ');
     ++newline_index;
   }
-  command.replace(index - 1, rspfile.length() + 1, rspfile_content);
+  if (command[index - 1] == '@') {
+    command.replace(index - 1, rspfile.length() + 1, rspfile_content);
+  } else if (command.find("-f ") == index - 3) {
+    command.replace(index - 3, rspfile.length() + 3, rspfile_content);
+  } else {  // --option-file syntax
+    command.replace(index - 14, rspfile.length() + 14, rspfile_content);
+  }
   return command;
 }
 
-void printCompdb(const char* const directory, const Edge* const edge,
-                 const EvaluateCommandMode eval_mode) {
-  printf("\n  {\n    \"directory\": \"");
-  PrintJSONString(directory);
-  printf("\",\n    \"command\": \"");
-  PrintJSONString(EvaluateCommandWithRspfile(edge, eval_mode));
-  printf("\",\n    \"file\": \"");
-  PrintJSONString(edge->inputs_[0]->path());
-  printf("\",\n    \"output\": \"");
-  PrintJSONString(edge->outputs_[0]->path());
-  printf("\"\n  }");
+/// Returns true if this edge's outputs are only used as validation
+/// dependencies by other edges, not as regular build inputs.
+bool IsValidationOnlyEdge(const Edge* edge) {
+  for (const Node* output : edge->outputs_) {
+    if (output->validation_out_edges().empty() ||
+        !output->out_edges().empty()) {
+      return false;
+    }
+  }
+  return !edge->outputs_.empty();
+}
+
+void PrintCompdbObjectsForEdge(std::string const& directory, const Edge* const edge,
+                               const EvaluateCommandMode eval_mode) {
+  const auto& command = EvaluateCommandWithRspfile(edge, eval_mode);
+  bool first = true;
+
+  for (const Node* input : edge->inputs_) {
+    if (!first) {
+      putchar(',');
+    }
+
+    printf("\n  {\n    \"directory\": \"");
+    PrintJSONString(directory);
+    printf("\",\n    \"command\": \"");
+    PrintJSONString(command);
+    printf("\",\n    \"file\": \"");
+    PrintJSONString(input->path());
+    printf("\",\n    \"output\": \"");
+    PrintJSONString(edge->outputs_[0]->path());
+    printf("\"\n  }");
+    first = false;
+  }
 }
 
 int NinjaMain::ToolCompilationDatabase(const Options* options, int argc,
@@ -940,37 +1090,25 @@ int NinjaMain::ToolCompilationDatabase(const Options* options, int argc,
   argc -= optind;
 
   bool first = true;
-  vector<char> cwd;
-  char* success = NULL;
 
-  do {
-    cwd.resize(cwd.size() + 1024);
-    errno = 0;
-    success = getcwd(&cwd[0], cwd.size());
-  } while (!success && errno == ERANGE);
-  if (!success) {
-    Error("cannot determine working directory: %s", strerror(errno));
-    return 1;
-  }
-
+  std::string directory = GetWorkingDirectory();
   putchar('[');
-  for (vector<Edge*>::iterator e = state_.edges_.begin();
-       e != state_.edges_.end(); ++e) {
-    if ((*e)->inputs_.empty())
+  for (const Edge* edge : state_.edges_) {
+    if (edge->inputs_.empty() || IsValidationOnlyEdge(edge))
       continue;
     if (argc == 0) {
       if (!first) {
         putchar(',');
       }
-      printCompdb(&cwd[0], *e, eval_mode);
+      PrintCompdbObjectsForEdge(directory, edge, eval_mode);
       first = false;
     } else {
       for (int i = 0; i != argc; ++i) {
-        if ((*e)->rule_->name() == argv[i]) {
+        if (edge->rule_->name() == argv[i]) {
           if (!first) {
             putchar(',');
           }
-          printCompdb(&cwd[0], *e, eval_mode);
+          PrintCompdbObjectsForEdge(directory, edge, eval_mode);
           first = false;
         }
       }
@@ -1000,19 +1138,24 @@ int NinjaMain::ToolRestat(const Options* options, int argc, char* argv[]) {
 
   optind = 1;
   int opt;
-  while ((opt = getopt(argc, argv, const_cast<char*>("h"))) != -1) {
+  const option kLongOptions[] = { { "builddir", required_argument, nullptr,
+                                    'b' },
+                                  { "help", no_argument, nullptr, 'h' },
+                                  { nullptr, 0, nullptr, 0 } };
+  while ((opt = getopt_long(argc, argv, const_cast<char*>("h"), kLongOptions,
+                            nullptr)) != -1) {
     switch (opt) {
+    case 'b':
+      build_dir_ = optarg;
+      break;
     case 'h':
     default:
-      printf("usage: ninja -t restat [outputs]\n");
+      printf("usage: ninja -t restat [--builddir=DIR] [outputs]\n");
       return 1;
     }
   }
   argv += optind;
   argc -= optind;
-
-  if (!EnsureBuildDirExists())
-    return 1;
 
   string log_path = ".ninja_log";
   if (!build_dir_.empty())
@@ -1048,6 +1191,118 @@ int NinjaMain::ToolRestat(const Options* options, int argc, char* argv[]) {
   }
 
   return EXIT_SUCCESS;
+}
+
+struct CompdbTargets {
+  enum class Action { kDisplayHelpAndExit, kEmitCommands };
+
+  Action action;
+  EvaluateCommandMode eval_mode = ECM_NORMAL;
+
+  std::vector<std::string> targets;
+
+  static CompdbTargets CreateFromArgs(int argc, char* argv[]) {
+    //
+    // grammar:
+    //     ninja -t compdb-targets [-hx] target [targets]
+    //
+    CompdbTargets ret;
+
+    // getopt_long() expects argv[0] to contain the name of
+    // the tool, i.e. "compdb-targets".
+    argc++;
+    argv--;
+
+    // Phase 1: parse options:
+    optind = 1;  // see `man 3 getopt` for documentation on optind
+    int opt;
+    while ((opt = getopt(argc, argv, const_cast<char*>("hx"))) != -1) {
+      switch (opt) {
+      case 'x':
+        ret.eval_mode = ECM_EXPAND_RSPFILE;
+        break;
+      case 'h':
+      default:
+        ret.action = CompdbTargets::Action::kDisplayHelpAndExit;
+        return ret;
+      }
+    }
+
+    // Phase 2: parse operands:
+    int const targets_begin = optind;
+    int const targets_end = argc;
+
+    if (targets_begin == targets_end) {
+      Error("compdb-targets expects the name of at least one target");
+      ret.action = CompdbTargets::Action::kDisplayHelpAndExit;
+    } else {
+      ret.action = CompdbTargets::Action::kEmitCommands;
+      for (int i = targets_begin; i < targets_end; ++i) {
+        ret.targets.push_back(argv[i]);
+      }
+    }
+
+    return ret;
+  }
+};
+
+void PrintCompdb(std::string const& directory, std::vector<Edge*> const& edges,
+                 const EvaluateCommandMode eval_mode) {
+  putchar('[');
+
+  bool first = true;
+  for (const Edge* edge : edges) {
+    if (edge->is_phony() || edge->inputs_.empty() || IsValidationOnlyEdge(edge))
+      continue;
+    if (!first)
+      putchar(',');
+    PrintCompdbObjectsForEdge(directory, edge, eval_mode);
+    first = false;
+  }
+
+  puts("\n]");
+}
+
+int NinjaMain::ToolCompilationDatabaseForTargets(const Options* options,
+                                                 int argc, char* argv[]) {
+  auto compdb = CompdbTargets::CreateFromArgs(argc, argv);
+
+  switch (compdb.action) {
+  case CompdbTargets::Action::kDisplayHelpAndExit: {
+    printf(
+        "usage: ninja -t compdb [-hx] target [targets]\n"
+        "\n"
+        "options:\n"
+        "  -h     display this help message\n"
+        "  -x     expand @rspfile style response file invocations\n");
+    return 1;
+  }
+
+  case CompdbTargets::Action::kEmitCommands: {
+    CommandCollector collector;
+
+    for (const std::string& target_arg : compdb.targets) {
+      std::string err;
+      Node* node = CollectTarget(target_arg.c_str(), &err);
+      if (!node) {
+        Fatal("%s", err.c_str());
+        return 1;
+      }
+      if (!node->in_edge()) {
+        Fatal(
+            "'%s' is not a target "
+            "(i.e. it is not an output of any `build` statement)",
+            node->path().c_str());
+      }
+      collector.CollectFrom(node);
+    }
+
+    std::string directory = GetWorkingDirectory();
+    PrintCompdb(directory, collector.in_edges, compdb.eval_mode);
+  } break;
+  }
+
+  return 0;
 }
 
 int NinjaMain::ToolUrtle(const Options* options, int argc, char** argv) {
@@ -1092,6 +1347,8 @@ const Tool* ChooseTool(const string& tool_name) {
       Tool::RUN_AFTER_LOAD, &NinjaMain::ToolCommands },
     { "inputs", "list all inputs required to rebuild given targets",
       Tool::RUN_AFTER_LOAD, &NinjaMain::ToolInputs},
+    { "multi-inputs", "print one or more sets of inputs required to build targets",
+      Tool::RUN_AFTER_LOAD, &NinjaMain::ToolMultiInputs},
     { "deps", "show dependencies stored in the deps log",
       Tool::RUN_AFTER_LOGS, &NinjaMain::ToolDeps },
     { "missingdeps", "check deps log dependencies on generated files",
@@ -1104,6 +1361,9 @@ const Tool* ChooseTool(const string& tool_name) {
       Tool::RUN_AFTER_LOAD, &NinjaMain::ToolTargets },
     { "compdb",  "dump JSON compilation database to stdout",
       Tool::RUN_AFTER_LOAD, &NinjaMain::ToolCompilationDatabase },
+    { "compdb-targets",
+      "dump JSON compilation database for a given list of targets to stdout",
+      Tool::RUN_AFTER_LOAD, &NinjaMain::ToolCompilationDatabaseForTargets },
     { "recompact",  "recompacts ninja-internal data structures",
       Tool::RUN_AFTER_LOAD, &NinjaMain::ToolRecompact },
     { "restat",  "restats all outputs in the build log",
@@ -1200,26 +1460,23 @@ bool WarningEnable(const string& name, Options* options) {
 "  phonycycle={err,warn}  phony build statement references itself\n"
     );
     return false;
-  } else if (name == "dupbuild=err") {
-    options->dupe_edges_should_err = true;
-    return true;
-  } else if (name == "dupbuild=warn") {
-    options->dupe_edges_should_err = false;
-    return true;
   } else if (name == "phonycycle=err") {
     options->phony_cycle_should_err = true;
     return true;
   } else if (name == "phonycycle=warn") {
     options->phony_cycle_should_err = false;
     return true;
+  } else if (name == "dupbuild=err" ||
+             name == "dupbuild=warn") {
+    Warning("deprecated warning 'dupbuild'");
+    return true;
   } else if (name == "depfilemulti=err" ||
              name == "depfilemulti=warn") {
     Warning("deprecated warning 'depfilemulti'");
     return true;
   } else {
-    const char* suggestion =
-        SpellcheckString(name.c_str(), "dupbuild=err", "dupbuild=warn",
-                         "phonycycle=err", "phonycycle=warn", NULL);
+    const char* suggestion = SpellcheckString(name.c_str(), "phonycycle=err",
+                                              "phonycycle=warn", nullptr);
     if (suggestion) {
       Error("unknown warning flag '%s', did you mean '%s'?",
             name.c_str(), suggestion);
@@ -1328,23 +1585,76 @@ bool NinjaMain::EnsureBuildDirExists() {
   return true;
 }
 
-int NinjaMain::RunBuild(int argc, char** argv, Status* status) {
-  string err;
-  vector<Node*> targets;
+std::unique_ptr<Jobserver::Client> NinjaMain::SetupJobserverClient(
+    Status* status) {
+  // Empty result by default.
+  std::unique_ptr<Jobserver::Client> result;
+
+  // If dry-run or explicit job count, don't even look at MAKEFLAGS
+  if (config_.disable_jobserver_client)
+    return result;
+
+  const char* makeflags = getenv("MAKEFLAGS");
+  if (!makeflags) {
+    // MAKEFLAGS is not defined.
+    return result;
+  }
+
+  std::string err;
+  Jobserver::Config jobserver_config;
+  if (!Jobserver::ParseNativeMakeFlagsValue(makeflags, &jobserver_config,
+                                            &err)) {
+    // MAKEFLAGS is defined but could not be parsed correctly.
+    if (config_.verbosity > BuildConfig::QUIET)
+      status->Warning("Ignoring jobserver: %s [%s]", err.c_str(), makeflags);
+    return result;
+  }
+
+  if (!jobserver_config.HasMode()) {
+    // MAKEFLAGS is defined, but does not describe a jobserver mode.
+    return result;
+  }
+
+  if (config_.verbosity > BuildConfig::NO_STATUS_UPDATE) {
+    status->Info("Jobserver mode detected: %s", makeflags);
+  }
+
+  result = Jobserver::Client::Create(jobserver_config, &err);
+  if (!result.get()) {
+    // Jobserver client initialization failed !?
+    if (config_.verbosity > BuildConfig::QUIET)
+      status->Error("Could not initialize jobserver: %s", err.c_str());
+  }
+  return result;
+}
+
+ExitStatus NinjaMain::RunBuild(int argc, char** argv, Status* status) {
+  std::string err;
+  std::vector<Node*> targets;
   if (!CollectTargetsFromArgs(argc, argv, &targets, &err)) {
     status->Error("%s", err.c_str());
-    return 1;
+    return ExitFailure;
   }
 
   disk_interface_.AllowStatCache(g_experimental_statcache);
 
+  // Detect jobserver context and inject Jobserver::Client into the builder
+  // if needed.
+  std::unique_ptr<Jobserver::Client> jobserver_client =
+      SetupJobserverClient(status);
+
   Builder builder(&state_, config_, &build_log_, &deps_log_, &disk_interface_,
                   status, start_time_millis_);
+
+  if (jobserver_client.get()) {
+    builder.SetJobserverClient(std::move(jobserver_client));
+  }
+
   for (size_t i = 0; i < targets.size(); ++i) {
     if (!builder.AddTarget(targets[i], &err)) {
       if (!err.empty()) {
         status->Error("%s", err.c_str());
-        return 1;
+        return ExitFailure;
       } else {
         // Added a target that is already up-to-date; not really
         // an error.
@@ -1356,19 +1666,21 @@ int NinjaMain::RunBuild(int argc, char** argv, Status* status) {
   disk_interface_.AllowStatCache(false);
 
   if (builder.AlreadyUpToDate()) {
-    status->Info("no work to do.");
-    return 0;
+    if (config_.verbosity != BuildConfig::NO_STATUS_UPDATE) {
+      status->Info("no work to do.");
+    }
+    return ExitSuccess;
   }
 
-  if (!builder.Build(&err)) {
+  ExitStatus exit_status = builder.Build(&err);
+  if (exit_status != ExitSuccess) {
     status->Info("build stopped: %s.", err.c_str());
     if (err.find("interrupted by user") != string::npos) {
-      return 2;
+      return ExitInterrupted;
     }
-    return 1;
   }
 
-  return 0;
+  return exit_status;
 }
 
 #ifdef _MSC_VER
@@ -1417,12 +1729,13 @@ int ReadFlags(int* argc, char*** argv,
               Options* options, BuildConfig* config) {
   DeferGuessParallelism deferGuessParallelism(config);
 
-  enum { OPT_VERSION = 1, OPT_QUIET = 2 };
+  enum { OPT_VERSION = 1, OPT_QUIET = 2, OPT_STATUS = 3 };
   const option kLongOptions[] = {
     { "help", no_argument, NULL, 'h' },
     { "version", no_argument, NULL, OPT_VERSION },
     { "verbose", no_argument, NULL, 'v' },
     { "quiet", no_argument, NULL, OPT_QUIET },
+    { "status", required_argument, NULL, OPT_STATUS },
     { NULL, 0, NULL, 0 }
   };
 
@@ -1440,26 +1753,29 @@ int ReadFlags(int* argc, char*** argv,
         break;
       case 'j': {
         char* end;
-        int value = strtol(optarg, &end, 10);
+        long value = strtol(optarg, &end, 10);
         if (*end != 0 || value < 0)
           Fatal("invalid -j parameter");
 
         // We want to run N jobs in parallel. For N = 0, INT_MAX
         // is close enough to infinite for most sane builds.
-        config->parallelism = value > 0 ? value : INT_MAX;
+        config->parallelism =
+            static_cast<int>((value > 0 && value < INT_MAX) ? value : INT_MAX);
+        config->disable_jobserver_client = true;
         deferGuessParallelism.needGuess = false;
         break;
       }
       case 'k': {
         char* end;
-        int value = strtol(optarg, &end, 10);
+        long value = strtol(optarg, &end, 10);
         if (*end != 0)
           Fatal("-k parameter not numeric; did you mean -k 0?");
 
         // We want to go until N jobs fail, which means we should allow
         // N failures and then stop.  For N <= 0, INT_MAX is close enough
         // to infinite for most sane builds.
-        config->failures_allowed = value > 0 ? value : INT_MAX;
+        config->failures_allowed =
+            static_cast<int>((value > 0 && value < INT_MAX) ? value : INT_MAX);
         break;
       }
       case 'l': {
@@ -1472,6 +1788,7 @@ int ReadFlags(int* argc, char*** argv,
       }
       case 'n':
         config->dry_run = true;
+        config->disable_jobserver_client = true;
         break;
       case 't':
         options->tool = ChooseTool(optarg);
@@ -1483,6 +1800,9 @@ int ReadFlags(int* argc, char*** argv,
         break;
       case OPT_QUIET:
         config->verbosity = BuildConfig::NO_STATUS_UPDATE;
+        break;
+      case OPT_STATUS:
+        config->progress_status_format = optarg;
         break;
       case 'w':
         if (!WarningEnable(optarg, options))
@@ -1513,7 +1833,6 @@ NORETURN void real_main(int argc, char** argv) {
   BuildConfig config;
   Options options = {};
   options.input_file = "build.ninja";
-  options.dupe_edges_should_err = true;
 
   setvbuf(stdout, NULL, _IOLBF, BUFSIZ);
   const char* ninja_command = argv[0];
@@ -1522,7 +1841,7 @@ NORETURN void real_main(int argc, char** argv) {
   if (exit_code >= 0)
     exit(exit_code);
 
-  Status* status = new StatusPrinter(config);
+  Status* status = Status::factory(config);
 
   if (options.working_dir) {
     // The formatting of this string, complete with funny quotes, is
@@ -1550,9 +1869,6 @@ NORETURN void real_main(int argc, char** argv) {
     NinjaMain ninja(ninja_command, config);
 
     ManifestParserOptions parser_opts;
-    if (options.dupe_edges_should_err) {
-      parser_opts.dupe_edge_action_ = kDupeEdgeActionError;
-    }
     if (options.phony_cycle_should_err) {
       parser_opts.phony_cycle_action_ = kPhonyCycleActionError;
     }
@@ -1588,7 +1904,9 @@ NORETURN void real_main(int argc, char** argv) {
       exit(1);
     }
 
-    int result = ninja.RunBuild(argc, argv, status);
+    ninja.ParsePreviousElapsedTimes();
+
+    ExitStatus result = ninja.RunBuild(argc, argv, status);
     if (g_metrics)
       ninja.DumpMetrics();
     exit(result);

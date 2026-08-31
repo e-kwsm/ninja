@@ -4,12 +4,13 @@
 *.pdb
 *.ilk
 /build*/
-/build.ninja
+/build*.ninja
 /ninja
 /ninja.bootstrap
 /build_log_perftest
 /canon_perftest
 /clparser_perftest
+/elide_middle_perftest
 /depfile_parser_perftest
 /hash_collision_bench
 /ninja_test

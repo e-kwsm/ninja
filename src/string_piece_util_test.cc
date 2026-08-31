@@ -23,7 +23,7 @@ TEST(StringPieceUtilTest, SplitStringPiece) {
     string input("a:b:c");
     vector<StringPiece> list = SplitStringPiece(input, ':');
 
-    EXPECT_EQ(list.size(), 3);
+    EXPECT_EQ(list.size(), size_t(3));
 
     EXPECT_EQ(list[0], "a");
     EXPECT_EQ(list[1], "b");
@@ -34,7 +34,7 @@ TEST(StringPieceUtilTest, SplitStringPiece) {
     string empty;
     vector<StringPiece> list = SplitStringPiece(empty, ':');
 
-    EXPECT_EQ(list.size(), 1);
+    EXPECT_EQ(list.size(), size_t(1));
 
     EXPECT_EQ(list[0], "");
   }
@@ -43,7 +43,7 @@ TEST(StringPieceUtilTest, SplitStringPiece) {
     string one("a");
     vector<StringPiece> list = SplitStringPiece(one, ':');
 
-    EXPECT_EQ(list.size(), 1);
+    EXPECT_EQ(list.size(), size_t(1));
 
     EXPECT_EQ(list[0], "a");
   }
@@ -52,7 +52,7 @@ TEST(StringPieceUtilTest, SplitStringPiece) {
     string sep_only(":");
     vector<StringPiece> list = SplitStringPiece(sep_only, ':');
 
-    EXPECT_EQ(list.size(), 2);
+    EXPECT_EQ(list.size(), size_t(2));
 
     EXPECT_EQ(list[0], "");
     EXPECT_EQ(list[1], "");
@@ -62,7 +62,7 @@ TEST(StringPieceUtilTest, SplitStringPiece) {
     string sep(":a:b:c:");
     vector<StringPiece> list = SplitStringPiece(sep, ':');
 
-    EXPECT_EQ(list.size(), 5);
+    EXPECT_EQ(list.size(), size_t(5));
 
     EXPECT_EQ(list[0], "");
     EXPECT_EQ(list[1], "a");
@@ -128,4 +128,19 @@ TEST(StringPieceUtilTest, EqualsCaseInsensitiveASCII) {
   EXPECT_FALSE(EqualsCaseInsensitiveASCII("a", "ac"));
   EXPECT_FALSE(EqualsCaseInsensitiveASCII("/", "\\"));
   EXPECT_FALSE(EqualsCaseInsensitiveASCII("1", "10"));
+}
+
+
+TEST(StringPieceUtilTest, StringPieceLess) {
+  const std::vector<StringPiece> strings = {
+    "", "A", "AbC", "a", "abc", "c", "ca",
+  };
+  const StringPieceLess less;
+
+  for (int l = 0; l < strings.size(); ++l) {
+    for (int r = 0; r < strings.size(); ++r) {
+      EXPECT_EQ(less(strings[l], strings[r]), l < r)
+          << strings[l].AsString() << " < " << strings[r].AsString();
+    }
+  }
 }

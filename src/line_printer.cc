@@ -28,9 +28,27 @@
 #include <sys/time.h>
 #endif
 
+#include "elide_middle.h"
 #include "util.h"
 
 using namespace std;
+
+namespace {
+bool EnvHasNoColor() {
+  char* no_color = std::getenv("NO_COLOR");
+  return no_color && std::string(no_color) != "0";
+}
+
+bool EnvHasCliColorForce() {
+  char* clicolor_force = std::getenv("CLICOLOR_FORCE");
+  return clicolor_force && std::string(clicolor_force) != "0";
+}
+
+bool EnvHasForceColor() {
+  char* force_color = std::getenv("FORCE_COLOR");
+  return force_color && std::string(force_color) != "0";
+}
+}  // anonymous namespace
 
 LinePrinter::LinePrinter() : have_blank_line_(true), console_locked_(false) {
   const char* term = getenv("TERM");
@@ -46,6 +64,9 @@ LinePrinter::LinePrinter() : have_blank_line_(true), console_locked_(false) {
   }
 #endif
   supports_color_ = smart_terminal_;
+  if (EnvHasNoColor()) {
+    supports_color_ = false;
+  }
 #ifdef _WIN32
   // Try enabling ANSI escape sequence support on Windows 10 terminals.
   if (supports_color_) {
@@ -58,8 +79,11 @@ LinePrinter::LinePrinter() : have_blank_line_(true), console_locked_(false) {
   }
 #endif
   if (!supports_color_) {
-    const char* clicolor_force = getenv("CLICOLOR_FORCE");
-    supports_color_ = clicolor_force && std::string(clicolor_force) != "0";
+    // NO_COLOR and CLICOLOR_FORCE: NO_COLOR "overrides" CLICOLOR_FORCE
+    // NO_COLOR and FORCE_COLOR: FORCE_COLOR "overrides" NO_COLOR
+    if ((!EnvHasNoColor() && EnvHasCliColorForce()) || EnvHasForceColor()) {
+      supports_color_ = true;
+    }
   }
 }
 
@@ -81,7 +105,7 @@ void LinePrinter::Print(string to_print, LineType type) {
     CONSOLE_SCREEN_BUFFER_INFO csbi;
     GetConsoleScreenBufferInfo(console_, &csbi);
 
-    to_print = ElideMiddle(to_print, static_cast<size_t>(csbi.dwSize.X));
+    ElideMiddleInPlace(to_print, static_cast<size_t>(csbi.dwSize.X));
     if (supports_color_) {  // this means ENABLE_VIRTUAL_TERMINAL_PROCESSING
                             // succeeded
       printf("%s\x1B[K", to_print.c_str());  // Clear to end of line.
@@ -108,7 +132,7 @@ void LinePrinter::Print(string to_print, LineType type) {
     // line-wrapping.
     winsize size;
     if ((ioctl(STDOUT_FILENO, TIOCGWINSZ, &size) == 0) && size.ws_col) {
-      to_print = ElideMiddle(to_print, size.ws_col);
+      ElideMiddleInPlace(to_print, size.ws_col);
     }
     printf("%s", to_print.c_str());
     printf("\x1B[K");  // Clear to end of line.
@@ -118,6 +142,7 @@ void LinePrinter::Print(string to_print, LineType type) {
     have_blank_line_ = false;
   } else {
     printf("%s\n", to_print.c_str());
+    fflush(stdout);
   }
 }
 

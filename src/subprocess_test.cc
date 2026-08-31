@@ -14,6 +14,7 @@
 
 #include "subprocess.h"
 
+#include "exit_status.h"
 #include "test.h"
 
 #ifndef _WIN32
@@ -38,6 +39,36 @@ struct SubprocessTest : public testing::Test {
   SubprocessSet subprocs_;
 };
 
+#ifndef _WIN32
+struct ScopedPipe {
+    int read_fd_ = -1;
+    int write_fd_ = -1;
+
+    ScopedPipe() {
+        int fds[2];
+        if (::pipe(fds) == -1) {
+            return;
+        }
+        read_fd_ = fds[0];
+        write_fd_ = fds[1];
+    }
+
+    ~ScopedPipe() {
+        if (read_fd_ >= 0) {
+            ::close(read_fd_);
+        }
+        if (write_fd_ >= 0) {
+            ::close(write_fd_);
+        }
+    }
+
+    // Check if both ends are valid
+    bool IsValid() const {
+        return read_fd_ >= 0 && write_fd_ >= 0;
+    }
+};
+#endif
+
 }  // anonymous namespace
 
 // Run a command that fails and emits to stderr.
@@ -50,7 +81,8 @@ TEST_F(SubprocessTest, BadCommandStderr) {
     subprocs_.DoWork();
   }
 
-  EXPECT_EQ(ExitFailure, subproc->Finish());
+  ExitStatus exit = subproc->Finish();
+  EXPECT_NE(ExitSuccess, exit);
   EXPECT_NE("", subproc->GetOutput());
 }
 
@@ -64,7 +96,8 @@ TEST_F(SubprocessTest, NoSuchCommand) {
     subprocs_.DoWork();
   }
 
-  EXPECT_EQ(ExitFailure, subproc->Finish());
+  ExitStatus exit = subproc->Finish();
+  EXPECT_NE(ExitSuccess, exit);
   EXPECT_NE("", subproc->GetOutput());
 #ifdef _WIN32
   ASSERT_EQ("CreateProcess failed: The system cannot find the file "
@@ -90,8 +123,8 @@ TEST_F(SubprocessTest, InterruptParent) {
   ASSERT_NE((Subprocess *) 0, subproc);
 
   while (!subproc->Done()) {
-    bool interrupted = subprocs_.DoWork();
-    if (interrupted)
+    SubprocessSet::WorkResult status = subprocs_.DoWork();
+    if (status == SubprocessSet::WorkResult::Interrupted)
       return;
   }
 
@@ -114,8 +147,8 @@ TEST_F(SubprocessTest, InterruptParentWithSigTerm) {
   ASSERT_NE((Subprocess *) 0, subproc);
 
   while (!subproc->Done()) {
-    bool interrupted = subprocs_.DoWork();
-    if (interrupted)
+    SubprocessSet::WorkResult status = subprocs_.DoWork();
+    if (status == SubprocessSet::WorkResult::Interrupted)
       return;
   }
 
@@ -138,8 +171,8 @@ TEST_F(SubprocessTest, InterruptParentWithSigHup) {
   ASSERT_NE((Subprocess *) 0, subproc);
 
   while (!subproc->Done()) {
-    bool interrupted = subprocs_.DoWork();
-    if (interrupted)
+    SubprocessSet::WorkResult status = subprocs_.DoWork();
+    if (status == SubprocessSet::WorkResult::Interrupted)
       return;
   }
 
@@ -227,7 +260,7 @@ TEST_F(SubprocessTest, SetWithLots) {
   ASSERT_EQ(0, getrlimit(RLIMIT_NOFILE, &rlim));
   if (rlim.rlim_cur < kNumProcs) {
     printf("Raise [ulimit -n] above %u (currently %lu) to make this test go\n",
-           kNumProcs, rlim.rlim_cur);
+           kNumProcs, static_cast<unsigned long>(rlim.rlim_cur));
     return;
   }
 
@@ -261,3 +294,38 @@ TEST_F(SubprocessTest, ReadStdin) {
   ASSERT_EQ(1u, subprocs_.finished_.size());
 }
 #endif  // _WIN32
+
+#ifndef _WIN32
+TEST_F(SubprocessTest, JobserverTokenAvailable) {
+  // Setup a mock jobserver by using a pipe.
+  // Give the read end of the pipe to SubprocessSet.
+  ScopedPipe mock_jobserver;
+  ASSERT_TRUE(mock_jobserver.IsValid());
+
+  int read_fd = mock_jobserver.read_fd_;
+  int write_fd = mock_jobserver.write_fd_;
+  subprocs_.SetJobserverFD(mock_jobserver.read_fd_);
+
+  // Trigger mock jobserver token availability by
+  // writing a byte to the write end of the pipe.
+  uint8_t token = 0;
+  ssize_t ret = ::write(write_fd, &token, 1);
+  ASSERT_EQ(1, ret);
+
+  // Assert we detected the jobserver token availability.
+  Subprocess* subproc = subprocs_.Add("sleep 1");
+  SubprocessSet::WorkResult result = subprocs_.DoWork();
+  ASSERT_EQ(SubprocessSet::WorkResult::JobserverTokenAvailable, result);
+
+  // To avoid busy waiting, set the jobserver fd to -1
+  subprocs_.SetJobserverFD(-1);
+
+  // Finish the subprocess to avoid leaks.
+  while (!subproc->Done()) {
+    subprocs_.DoWork();
+  }
+
+  ASSERT_EQ(ExitSuccess, subproc->Finish());
+  ASSERT_EQ(1u, subprocs_.finished_.size());
+}
+#endif
