@@ -127,6 +127,7 @@ int Cleaner::CleanAll(bool generator) {
 int Cleaner::CleanDead(const BuildLog::Entries& entries) {
   Reset();
   PrintHeader();
+  LoadDyndeps();
   for (BuildLog::Entries::const_iterator i = entries.begin(); i != entries.end(); ++i) {
     Node* n = state_->LookupNode(i->first);
     // Detecting stale outputs works as follows:
@@ -150,7 +151,12 @@ void Cleaner::DoCleanTarget(Node* target) {
   if (Edge* e = target->in_edge()) {
     // Do not try to remove phony targets
     if (!e->is_phony()) {
-      Remove(target->path());
+      // Remove all outputs of this edge, not just the named target.
+      // A multi-output edge produces all its outputs from a single command,
+      // so they must be cleaned together.
+      for (Node* output : e->outputs_) {
+        Remove(output->path());
+      }
       RemoveEdgeFiles(e);
     }
     for (vector<Node*>::iterator n = e->inputs_.begin(); n != e->inputs_.end();
@@ -292,7 +298,8 @@ void Cleaner::LoadDyndeps() {
   // Load dyndep files that exist, before they are cleaned.
   for (vector<Edge*>::iterator e = state_->edges_.begin();
        e != state_->edges_.end(); ++e) {
-    if (Node* dyndep = (*e)->dyndep_) {
+    Node* dyndep = (*e)->dyndep_;
+    if (dyndep && dyndep->dyndep_pending()) {
       // Capture and ignore errors loading the dyndep file.
       // We clean as much of the graph as we know.
       std::string err;

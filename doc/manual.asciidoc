@@ -24,7 +24,7 @@ Where other build systems are high-level languages, Ninja aims to be
 an assembler.
 
 Build systems get slow when they need to make decisions.  When you are
-in a edit-compile cycle you want it to be as fast as possible -- you
+in an edit-compile cycle you want it to be as fast as possible -- you
 want the build system to do the minimum work necessary to figure out
 what needs to be built immediately.
 
@@ -187,29 +187,99 @@ Ninja defaults to running commands in parallel anyway, so typically
 you don't need to pass `-j`.)
 
 
+GNU Jobserver support
+~~~~~~~~~~~~~~~~~~~~~
+
+Since version 1.13., Ninja builds can follow the
+https://www.gnu.org/software/make/manual/html_node/Job-Slots.html[GNU Make jobserver]
+client protocol. This is useful when Ninja is invoked as part of a larger
+build system controlled by a top-level GNU Make instance, or any other
+jobserver pool implementation, as it allows better coordination between
+concurrent build tasks.
+
+This feature is automatically enabled under the following conditions:
+
+- Dry-run (i.e. `-n` or `--dry-run`) is not enabled.
+
+- No explicit job count (e.g. `-j<COUNT>`) is passed on the command
+  line.
+
+- The `MAKEFLAGS` environment variable is defined and describes a valid
+  jobserver mode using `--jobserver-auth=SEMAPHORE_NAME` on Windows, or
+  `--jobserver-auth=fifo:PATH` on Posix.
+
+In this case, Ninja will use the jobserver pool of job slots to control
+parallelism, instead of its default parallel implementation.
+
+Note that load-average limitations (i.e. when using `-l<count>`)
+are still being enforced in this mode.
+
+IMPORTANT: On Posix, only the FIFO-based version of the protocol, which is
+implemented by GNU Make 4.4 and higher, is supported. Ninja will detect
+when a pipe-based jobserver is being used (i.e. when `MAKEFLAGS` contains
+`--jobserver-auth=<read>,<write>`) and will print a warning, but will
+otherwise ignore it.
+
 Environment variables
 ~~~~~~~~~~~~~~~~~~~~~
 
-Ninja supports one environment variable to control its behavior:
+Ninja supports two environment variables to control its behavior:
 `NINJA_STATUS`, the progress status printed before the rule being run.
 
 Several placeholders are available:
 
 `%s`:: The number of started edges.
 `%t`:: The total number of edges that must be run to complete the build.
-`%p`:: The percentage of started edges.
+`%p`:: The percentage of finished edges.
 `%r`:: The number of currently running edges.
 `%u`:: The number of remaining edges to start.
 `%f`:: The number of finished edges.
 `%o`:: Overall rate of finished edges per second
 `%c`:: Current rate of finished edges per second (average over builds
 specified by `-j` or its default)
-`%e`:: Elapsed time in seconds.  _(Available since Ninja 1.2.)_
+`%e`:: Elapsed time in seconds. _(Available since Ninja 1.2.)_
+`%E`:: Remaining time (ETA) in seconds. _(Available since Ninja 1.12.)_
+`%w`:: Elapsed time in [h:]mm:ss format. _(Available since Ninja 1.12.)_
+`%W`:: Remaining time (ETA) in [h:]mm:ss format. _(Available since Ninja 1.12.)_
+`%P`:: The percentage (in ppp% format) of time elapsed out of predicted total runtime. _(Available since Ninja 1.12.)_
 `%%`:: A plain `%` character.
 
 The default progress status is `"[%f/%t] "` (note the trailing space
 to separate from the build rule). Another example of possible progress status
 could be `"[%u/%r/%f] "`.
+
+The `--status FMT` command-line flag also configures the progress status,
+but uses Ninja's regular variable-expansion syntax (`$var` or `${var}`)
+instead of `%`-escapes, with descriptive variable names. When passed,
+it takes precedence over `NINJA_STATUS`.
+
+The available variables and their `NINJA_STATUS` equivalents are:
+
+`$started`:: `%s` -- The number of started edges.
+`$total`:: `%t` -- The total number of edges.
+`$progress`:: `%p` -- The percentage of finished edges.
+`$running`:: `%r` -- The number of currently running edges.
+`$remaining`:: `%u` -- The number of remaining edges to start.
+`$finished`:: `%f` -- The number of finished edges.
+`$rate`:: `%o` -- Overall rate of finished edges per second.
+`$current_rate`:: `%c` -- Current rate of finished edges per second.
+`$elapsed_seconds`:: `%e` -- Elapsed time in seconds.
+`$eta_seconds`:: `%E` -- Remaining time (ETA) in seconds.
+`$elapsed`:: `%w` -- Elapsed time in [h:]mm:ss format.
+`$eta`:: `%W` -- Remaining time (ETA) in [h:]mm:ss format.
+`$predicted_progress`:: `%P` -- Percentage (in `ppp%` format) of time elapsed
+out of predicted total runtime.
+`$description`:: The current edge's `description` (or its command, when the
+description is empty or `--verbose` is in effect). Unlike `NINJA_STATUS`,
+which always appends the description after the formatted status, `--status`
+only shows the description where `$description` appears in the format. Omit
+it to drop the description entirely; place it wherever you want it shown.
+
+To produce a literal `$`, use `$$`. The `--status` flag was added in Ninja 1.14.
+
+If `MAKEFLAGS` is defined in the environment, if may alter how
+Ninja dispatches parallel build commands. See the GNU Jobserver support
+section for details.
 
 Extra tools
 ~~~~~~~~~~~
@@ -222,14 +292,16 @@ found useful during Ninja's development.  The current tools are:
 
 `browse`:: browse the dependency graph in a web browser.  Clicking a
 file focuses the view on that file, showing inputs and outputs.  This
-feature requires a Python installation. By default port 8000 is used
+feature requires a Python installation. By default, port 8000 is used
 and a web browser will be opened. This can be changed as follows:
 +
 ----
 ninja -t browse --port=8000 --no-browser mytarget
 ----
 +
-`graph`:: output a file in the syntax used by `graphviz`, a automatic
+Use `--help` to see a full list of options.
++
+`graph`:: output a file in the syntax used by `graphviz`, an automatic
 graph layout tool.  Use it like:
 +
 ----
@@ -255,13 +327,55 @@ than the _depth_ mode.
 
 `commands`:: given a list of targets, print a list of commands which, if
 executed in order, may be used to rebuild those targets, assuming that all
-output files are out of date.
+output files are out of date. Use `-s` to only print the final command, not the chain.
 
 `inputs`:: given a list of targets, print a list of all inputs used to
-rebuild those targets.
+rebuild those targets. For compatibility reasons, inputs are shell-quoted by default.
+Use `--no-shell-escape` to disable quoting. See `ninja -t inputs --help` for all options.
 _Available since Ninja 1.11._
 
-`clean`:: remove built files. By default it removes all built files
+`multi-inputs`:: print one or more sets of inputs required to build targets.
+Each line will consist of a target, a delimiter, an input and a terminator character.
+The list produced by the tool can be helpful if one would like to know which targets
+that are affected by a certain input.
++
+The output will be a series of lines with the following elements:
++
+----
+<target> <delimiter> <input> <terminator>
+----
++
+The default `<delimiter>` is a single TAB character.
+The delimiter can be modified to any string using the `--delimiter` argument.
++
+The default `<terminator>` is a line terminator (i.e. `\n` on Posix and `\r\n` on Windows).
+The terminator can be changed to `\0` by using the `--print0` argument.
++
+----
+----
++
+Example usage of the `multi-inputs` tool:
++
+----
+ninja -t multi-inputs target1 target2 target3
+----
++
+Example of produced output from the `multi-inputs` tool:
++
+----
+target1 file1.c
+target2 file1.c
+target2 file2.c
+target3 file1.c
+target3 file2.c
+target3 file3.c
+----
++
+_Note that a given input may appear for several targets if it is used by more
+than one targets._
+_Available since Ninja 1.13._
+
+`clean`:: remove built files. By default, it removes all built files
 except for those created by the generator.  Adding the `-g` flag also
 removes built files created by the generator (see <<ref_rule,the rule
 reference for the +generator+ attribute>>).  Additional arguments are
@@ -282,8 +396,13 @@ build file. _Available since Ninja 1.10._
 C family language compiler rule whose first input is the name of the
 source file, prints on standard output a compilation database in the
 http://clang.llvm.org/docs/JSONCompilationDatabase.html[JSON format] expected
-by the Clang tooling interface.
+by the Clang tooling interface. Use `-x` to expand `@rspfile` response file invocations.
 _Available since Ninja 1.2._
+
+`compdb-targets`:: like `compdb`, but takes a list of targets instead of rules,
+and expects at least one target. The resulting compilation database contains
+all commands required to build the indicated targets, and _only_ those
+commands. Use `-x` to expand `@rspfile` response file invocations.
 
 `deps`:: show all dependencies stored in the `.ninja_deps` file. When given a
 target, show just the target's dependencies. _Available since Ninja 1.4._
@@ -307,6 +426,9 @@ _Available since Ninja 1.11._
 
 `restat`:: updates all recorded file modification timestamps in the `.ninja_log`
 file. _Available since Ninja 1.10._
++
+The build manifest won't be parsed when running this tool. If you're using a
+`builddir` you must pass it via `--builddir=DIR`. _Available since Ninja 1.14._
 
 `rules`:: output the list of all rules. It can be used to know which rule name
 to pass to +ninja -t targets rule _name_+ or +ninja -t compdb+. Adding the `-d`
@@ -324,20 +446,19 @@ Where `ENVFILE` is a binary file that contains an environment block suitable
 for CreateProcessA() on Windows (i.e. a series of zero-terminated strings that
 look like NAME=VALUE, followed by an extra zero terminator). Note that this uses
 the local codepage encoding.
-
++
 This tool also supports a deprecated way of parsing the compiler's output when
-the `/showIncludes` flag is used, and generating a GCC-compatible depfile from it.
+the `/showIncludes` flag is used, and generating a GCC-compatible depfile from it:
 +
----
+----
 ninja -t msvc -o DEPFILE [-p STRING] -- cl.exe /showIncludes <arguments>
----
+----
 +
-
 When using this option, `-p STRING` can be used to pass the localized line prefix
 that `cl.exe` uses to output dependency information. For English-speaking regions
 this is `"Note: including file: "` without the double quotes, but will be different
 for other regions.
-
++
 Note that Ninja supports this natively now, with the use of `deps = msvc` and
 `msvc_deps_prefix` in Ninja files. Native support also avoids launching an extra
 tool process each time the compiler must be called, which can speed up builds
@@ -674,14 +795,14 @@ Ninja supports this processing in two forms.
    as a temporary).
 
 2. `deps = msvc` specifies that the tool outputs header dependencies
-   in the form produced by Visual Studio's compiler's
+   in the form produced by the Visual Studio compiler's
    http://msdn.microsoft.com/en-us/library/hdkef6tk(v=vs.90).aspx[`/showIncludes`
    flag].  Briefly, this means the tool outputs specially-formatted lines
    to its stdout.  Ninja then filters these lines from the displayed
    output.  No `depfile` attribute is necessary, but the localized string
-   in front of the the header file path. For instance
+   in front of the header file path should be globally defined. For instance,
    `msvc_deps_prefix = Note: including file:`
-   for a English Visual Studio (the default). Should be globally defined.
+   for an English Visual Studio (the default).
 +
 ----
 msvc_deps_prefix = Note: including file:
@@ -783,7 +904,7 @@ A file is a series of declarations.  A declaration can be one of:
    Order-only dependencies may be tacked on the end with +||
    _dependency1_ _dependency2_+.  (See <<ref_dependencies,the reference on
    dependency types>>.)
-   Validations may be taked on the end with +|@ _validation1_ _validation2_+.
+   Validations may be tacked on the end with +|@ _validation1_ _validation2_+.
    (See <<validations,the reference on validations>>.)
 +
 Implicit outputs _(available since Ninja 1.7)_ may be added before
@@ -830,6 +951,15 @@ paths, where a space would otherwise separate filenames.  See below.)
 
 `$:` :: a colon.  (This is only necessary in `build` lines, where a colon
 would otherwise terminate the list of outputs.)
+
+`$^` :: a newline _(available since Ninja 1.14)_.
+
+Inserts '\n' into the resulting string. This is useful to
+write build commands that require several shell lines as a single `command`
+value in the build plan.
+
+Requires `ninja_required_version` to be specified and greater or equal to 1.14
+in the build file.
 
 `$$`:: a literal `$`.
 
@@ -931,6 +1061,9 @@ keys.
 `out`:: the space-separated list of files provided as outputs to the build line
   referencing this `rule`, shell-quoted if it appears in commands.
 
+`pool`:: _(Available since Ninja 1.1.)_ used to allocate one or more rules or edges a
+  finite number of concurrent jobs. See the <<ref_pool,pools>> section for details.
+
 `restat`:: if present, causes Ninja to re-stat the command's outputs
   after execution of the command.  Each output whose modification time
   the command did not change will be treated as though it had never
@@ -964,14 +1097,14 @@ Fundamentally, command lines behave differently on Unixes and Windows.
 
 On Unixes, commands are arrays of arguments.  The Ninja `command`
 variable is passed directly to `sh -c`, which is then responsible for
-interpreting that string into an argv array.  Therefore the quoting
+interpreting that string into an argv array.  Therefore, the quoting
 rules are those of the shell, and you can use all the normal shell
 operators, like `&&` to chain multiple commands, or `VAR=value cmd` to
 set environment variables.
 
 On Windows, commands are strings, so Ninja passes the `command` string
 directly to `CreateProcess`.  (In the common case of simply executing
-a compiler this means there is less overhead.)  Consequently the
+a compiler this means there is less overhead.)  Consequently, the
 quoting rules are determined by the called program, which on Windows
 are usually provided by the C library.  If you need shell
 interpretation of the command (such as the use of `&&` to chain
@@ -992,7 +1125,7 @@ This is the standard form of output to be used for e.g. the
 object file of a compile command.
 
 2. _Implicit outputs_, as listed in a build line with the syntax +|
-   _out1_ _out2_+ + before the `:` of a build line _(available since
+   _out1_ _out2_+ before the `:` of a build line _(available since
    Ninja 1.7)_.  The semantics are identical to explicit outputs,
   the only difference is that implicit outputs don't show up in the
   `$out` variable.
@@ -1022,8 +1155,8 @@ source file of a compile command.
 +
 This is for expressing dependencies that don't show up on the
 command line of the command; for example, for a rule that runs a
-script that reads a hardcoded file, the hardcoded file should 
-be an implicit dependency, as changes to the file should cause 
+script that reads a hardcoded file, the hardcoded file should
+be an implicit dependency, as changes to the file should cause
 the output to rebuild, even though it doesn't show up in the arguments.
 +
 Note that dependencies as loaded through depfiles have slightly different
@@ -1046,6 +1179,9 @@ relative path, pointing to the same file, are considered different by Ninja.
 [[validations]]
 Validations
 ~~~~~~~~~~~
+
+_Available since Ninja 1.11._
+
 Validations listed on the build line cause the specified files to be
 added to the top level of the build graph (as if they were specified
 on the Ninja command line) whenever the build line is a transitive
@@ -1061,7 +1197,7 @@ A build edge can list another build edge as a validation even if the second
 edge depends on the first.
 
 Validations are designed to handle rules that perform error checking but
-don't produce any artifacts needed by the build, for example static
+don't produce any artifacts needed by the build, for example, static
 analysis tools.  Marking the static analysis rule as an implicit input
 of the main build rule of the source files or of the rules that depend
 on the main build rule would slow down the critical path of the build,
@@ -1154,6 +1290,16 @@ discovered dependency information for `out`.  This may include additional
 implicit inputs and/or outputs.  Ninja will update the build graph
 accordingly and the build will proceed as if the information was known
 originally.
+
+A dyndep file may only affect dependent portions of the build graph,
+i.e., the set of build statements that specify the file as a `dyndep`
+binding, or build statements known by the _original_ build manifest
+to depend directly or indirectly on at least one member of that set.
+In particular, dynamically discovered outputs of a build statement
+may not correspond to inputs of build statements that were originally
+independent of the dyndep file.  In other words, a dyndep file may
+not change the build graph in a way that causes up-to-date build
+statements to become out-of-date.
 
 Dyndep file reference
 ~~~~~~~~~~~~~~~~~~~~~

@@ -13,14 +13,15 @@
 // limitations under the License.
 
 #include "graph.h"
-#include "build.h"
 
+#include "build.h"
+#include "command_collector.h"
 #include "test.h"
 
 using namespace std;
 
 struct GraphTest : public StateTestWithBuiltinRules {
-  GraphTest() : scan_(&state_, NULL, NULL, &fs_, NULL) {}
+  GraphTest() : scan_(&state_, NULL, NULL, &fs_, NULL, NULL) {}
 
   VirtualFileSystem fs_;
   DependencyScan scan_;
@@ -108,7 +109,7 @@ TEST_F(GraphTest, ImplicitOutputParse) {
 "build out | out.imp: cat in\n"));
 
   Edge* edge = GetNode("out")->in_edge();
-  EXPECT_EQ(2, edge->outputs_.size());
+  EXPECT_EQ(size_t(2), edge->outputs_.size());
   EXPECT_EQ("out", edge->outputs_[0]->path());
   EXPECT_EQ("out.imp", edge->outputs_[1]->path());
   EXPECT_EQ(1, edge->implicit_outs_);
@@ -150,7 +151,7 @@ TEST_F(GraphTest, ImplicitOutputOnlyParse) {
 "build | out.imp: cat in\n"));
 
   Edge* edge = GetNode("out.imp")->in_edge();
-  EXPECT_EQ(1, edge->outputs_.size());
+  EXPECT_EQ(size_t(1), edge->outputs_.size());
   EXPECT_EQ("out.imp", edge->outputs_[0]->path());
   EXPECT_EQ(1, edge->implicit_outs_);
   EXPECT_EQ(edge, GetNode("out.imp")->in_edge());
@@ -215,28 +216,90 @@ TEST_F(GraphTest, RootNodes) {
   }
 }
 
-TEST_F(GraphTest, CollectInputs) {
+TEST_F(GraphTest, InputsCollector) {
+  // Build plan for the following graph:
+  //
+  //      in1
+  //       |___________
+  //       |           |
+  //      ===         ===
+  //       |           |
+  //      out1        mid1
+  //       |       ____|_____
+  //       |      |          |
+  //       |     ===      =======
+  //       |      |       |     |
+  //       |     out2    out3  out4
+  //       |      |       |
+  //      =======phony======
+  //              |
+  //             all
+  //
+  ASSERT_NO_FATAL_FAILURE(AssertParse(&state_,
+                                      "build out1: cat in1\n"
+                                      "build mid1: cat in1\n"
+                                      "build out2: cat mid1\n"
+                                      "build out3 out4: cat mid1\n"
+                                      "build all: phony out1 out2 out3\n"));
+
+  InputsCollector collector;
+
+  // Start visit from out1, this should add in1 to the inputs.
+  collector.Reset();
+  collector.VisitNode(GetNode("out1"));
+  auto inputs = collector.GetInputsAsStrings();
+  ASSERT_EQ(1u, inputs.size());
+  EXPECT_EQ("in1", inputs[0]);
+
+  // Add a visit from out2, this should add mid1.
+  collector.VisitNode(GetNode("out2"));
+  inputs = collector.GetInputsAsStrings();
+  ASSERT_EQ(2u, inputs.size());
+  EXPECT_EQ("in1", inputs[0]);
+  EXPECT_EQ("mid1", inputs[1]);
+
+  // Another visit from all, this should add out1, out2 and out3,
+  // but not out4.
+  collector.VisitNode(GetNode("all"));
+  inputs = collector.GetInputsAsStrings();
+  ASSERT_EQ(5u, inputs.size());
+  EXPECT_EQ("in1", inputs[0]);
+  EXPECT_EQ("mid1", inputs[1]);
+  EXPECT_EQ("out1", inputs[2]);
+  EXPECT_EQ("out2", inputs[3]);
+  EXPECT_EQ("out3", inputs[4]);
+
+  collector.Reset();
+
+  // Starting directly from all, will add out1 before mid1 compared
+  // to the previous example above.
+  collector.VisitNode(GetNode("all"));
+  inputs = collector.GetInputsAsStrings();
+  ASSERT_EQ(5u, inputs.size());
+  EXPECT_EQ("in1", inputs[0]);
+  EXPECT_EQ("out1", inputs[1]);
+  EXPECT_EQ("mid1", inputs[2]);
+  EXPECT_EQ("out2", inputs[3]);
+  EXPECT_EQ("out3", inputs[4]);
+}
+
+TEST_F(GraphTest, InputsCollectorWithEscapes) {
   ASSERT_NO_FATAL_FAILURE(AssertParse(
       &state_,
       "build out$ 1: cat in1 in2 in$ with$ space | implicit || order_only\n"));
 
-  std::vector<std::string> inputs;
-  Edge* edge = GetNode("out 1")->in_edge();
-
-  // Test without shell escaping.
-  inputs.clear();
-  edge->CollectInputs(false, &inputs);
-  EXPECT_EQ(5u, inputs.size());
+  InputsCollector collector;
+  collector.VisitNode(GetNode("out 1"));
+  auto inputs = collector.GetInputsAsStrings();
+  ASSERT_EQ(5u, inputs.size());
   EXPECT_EQ("in1", inputs[0]);
   EXPECT_EQ("in2", inputs[1]);
   EXPECT_EQ("in with space", inputs[2]);
   EXPECT_EQ("implicit", inputs[3]);
   EXPECT_EQ("order_only", inputs[4]);
 
-  // Test with shell escaping.
-  inputs.clear();
-  edge->CollectInputs(true, &inputs);
-  EXPECT_EQ(5u, inputs.size());
+  inputs = collector.GetInputsAsStrings(true);
+  ASSERT_EQ(5u, inputs.size());
   EXPECT_EQ("in1", inputs[0]);
   EXPECT_EQ("in2", inputs[1]);
 #ifdef _WIN32
@@ -246,6 +309,54 @@ TEST_F(GraphTest, CollectInputs) {
 #endif
   EXPECT_EQ("implicit", inputs[3]);
   EXPECT_EQ("order_only", inputs[4]);
+}
+
+TEST_F(GraphTest, CommandCollector) {
+  ASSERT_NO_FATAL_FAILURE(AssertParse(&state_,
+                                      "build out1: cat in1\n"
+                                      "build mid1: cat in1\n"
+                                      "build out2: cat mid1\n"
+                                      "build out3 out4: cat mid1\n"
+                                      "build all: phony out1 out2 out3\n"));
+  {
+    CommandCollector collector;
+    auto& edges = collector.in_edges;
+
+    // Start visit from out2; this should add `build mid1` and `build out2` to
+    // the edge list.
+    collector.CollectFrom(GetNode("out2"));
+    ASSERT_EQ(2u, edges.size());
+    EXPECT_EQ("cat in1 > mid1", edges[0]->EvaluateCommand());
+    EXPECT_EQ("cat mid1 > out2", edges[1]->EvaluateCommand());
+
+    // Add a visit from out1, this should append `build out1`
+    collector.CollectFrom(GetNode("out1"));
+    ASSERT_EQ(3u, edges.size());
+    EXPECT_EQ("cat in1 > out1", edges[2]->EvaluateCommand());
+
+    // Another visit from all; this should add edges for out1, out2 and out3,
+    // but not all (because it's phony).
+    collector.CollectFrom(GetNode("all"));
+    ASSERT_EQ(4u, edges.size());
+    EXPECT_EQ("cat in1 > mid1", edges[0]->EvaluateCommand());
+    EXPECT_EQ("cat mid1 > out2", edges[1]->EvaluateCommand());
+    EXPECT_EQ("cat in1 > out1", edges[2]->EvaluateCommand());
+    EXPECT_EQ("cat mid1 > out3 out4", edges[3]->EvaluateCommand());
+  }
+
+  {
+    CommandCollector collector;
+    auto& edges = collector.in_edges;
+
+    // Starting directly from all, will add `build out1` before `build mid1`
+    // compared to the previous example above.
+    collector.CollectFrom(GetNode("all"));
+    ASSERT_EQ(4u, edges.size());
+    EXPECT_EQ("cat in1 > out1", edges[0]->EvaluateCommand());
+    EXPECT_EQ("cat in1 > mid1", edges[1]->EvaluateCommand());
+    EXPECT_EQ("cat mid1 > out2", edges[2]->EvaluateCommand());
+    EXPECT_EQ("cat mid1 > out3 out4", edges[3]->EvaluateCommand());
+  }
 }
 
 TEST_F(GraphTest, VarInOutPathEscaping) {
@@ -429,6 +540,8 @@ TEST_F(GraphTest, CycleWithLengthZeroFromDepfile) {
 "build a b: deprule\n"
   );
   fs_.Create("dep.d", "a: b\n");
+  fs_.Create("b", "");
+  fs_.Create("a", "");
 
   string err;
   EXPECT_FALSE(scan_.RecomputeDirty(GetNode("a"), NULL, &err));
@@ -438,8 +551,32 @@ TEST_F(GraphTest, CycleWithLengthZeroFromDepfile) {
   // but the depfile also adds b as an input), the deps should have been loaded
   // only once:
   Edge* edge = GetNode("a")->in_edge();
-  EXPECT_EQ(1, edge->inputs_.size());
+  EXPECT_EQ(size_t(1), edge->inputs_.size());
   EXPECT_EQ("b", edge->inputs_[0]->path());
+}
+
+// Verify that depfiles are NOT loaded when the manifest inputs of an edge
+// are already marked dirty.
+TEST_F(GraphTest, ManifestInputDirtyNoDepfileLoad) {
+  AssertParse(&state_,
+              R"ninja(
+rule deprule
+  depfile = dep.d
+  command = unused
+build a b: deprule input
+)ninja");
+  fs_.Create("dep.d", "a: input_deps\n");
+  fs_.Create("input", "");
+  fs_.Create("input_deps", "");
+
+  string err;
+  EXPECT_TRUE(scan_.RecomputeDirty(GetNode("a"), NULL, &err));
+  ASSERT_EQ("", err);
+
+  // in_edge of 'a' does have one input, depfile is not loaded
+  Edge* edge = GetNode("a")->in_edge();
+  ASSERT_EQ(std::size_t(1), edge->inputs_.size());
+  EXPECT_EQ(edge->inputs_[0]->path(), "input");
 }
 
 // Like CycleWithLengthZeroFromDepfile but with a higher cycle length.
@@ -454,6 +591,8 @@ TEST_F(GraphTest, CycleWithLengthOneFromDepfile) {
 "build c: r b\n"
   );
   fs_.Create("dep.d", "a: c\n");
+  fs_.Create("b", "");
+  fs_.Create("a", "");
 
   string err;
   EXPECT_FALSE(scan_.RecomputeDirty(GetNode("a"), NULL, &err));
@@ -463,7 +602,7 @@ TEST_F(GraphTest, CycleWithLengthOneFromDepfile) {
   // but c's in_edge has b as input but the depfile also adds |edge| as
   // output)), the deps should have been loaded only once:
   Edge* edge = GetNode("a")->in_edge();
-  EXPECT_EQ(1, edge->inputs_.size());
+  EXPECT_EQ(size_t(1), edge->inputs_.size());
   EXPECT_EQ("c", edge->inputs_[0]->path());
 }
 
@@ -481,6 +620,8 @@ TEST_F(GraphTest, CycleWithLengthOneFromDepfileOneHopAway) {
 "build d: r a\n"
   );
   fs_.Create("dep.d", "a: c\n");
+  fs_.Create("b", "");
+  fs_.Create("a", "");
 
   string err;
   EXPECT_FALSE(scan_.RecomputeDirty(GetNode("d"), NULL, &err));
@@ -490,7 +631,7 @@ TEST_F(GraphTest, CycleWithLengthOneFromDepfileOneHopAway) {
   // but c's in_edge has b as input but the depfile also adds |edge| as
   // output)), the deps should have been loaded only once:
   Edge* edge = GetNode("a")->in_edge();
-  EXPECT_EQ(1, edge->inputs_.size());
+  EXPECT_EQ(size_t(1), edge->inputs_.size());
   EXPECT_EQ("c", edge->inputs_[0]->path());
 }
 
@@ -534,13 +675,13 @@ TEST_F(GraphTest, DyndepLoadTrivial) {
   EXPECT_FALSE(GetNode("dd")->dyndep_pending());
 
   Edge* edge = GetNode("out")->in_edge();
-  ASSERT_EQ(1u, edge->outputs_.size());
+  ASSERT_EQ(size_t(1), edge->outputs_.size());
   EXPECT_EQ("out", edge->outputs_[0]->path());
-  ASSERT_EQ(2u, edge->inputs_.size());
+  ASSERT_EQ(size_t(2), edge->inputs_.size());
   EXPECT_EQ("in", edge->inputs_[0]->path());
   EXPECT_EQ("dd", edge->inputs_[1]->path());
-  EXPECT_EQ(0u, edge->implicit_deps_);
-  EXPECT_EQ(1u, edge->order_only_deps_);
+  EXPECT_EQ(0, edge->implicit_deps_);
+  EXPECT_EQ(1, edge->order_only_deps_);
   EXPECT_FALSE(edge->GetBindingBool("restat"));
 }
 
@@ -564,14 +705,14 @@ TEST_F(GraphTest, DyndepLoadImplicit) {
   EXPECT_FALSE(GetNode("dd")->dyndep_pending());
 
   Edge* edge = GetNode("out1")->in_edge();
-  ASSERT_EQ(1u, edge->outputs_.size());
+  ASSERT_EQ(size_t(1), edge->outputs_.size());
   EXPECT_EQ("out1", edge->outputs_[0]->path());
-  ASSERT_EQ(3u, edge->inputs_.size());
+  ASSERT_EQ(size_t(3), edge->inputs_.size());
   EXPECT_EQ("in", edge->inputs_[0]->path());
   EXPECT_EQ("out2", edge->inputs_[1]->path());
   EXPECT_EQ("dd", edge->inputs_[2]->path());
-  EXPECT_EQ(1u, edge->implicit_deps_);
-  EXPECT_EQ(1u, edge->order_only_deps_);
+  EXPECT_EQ(1, edge->implicit_deps_);
+  EXPECT_EQ(1, edge->order_only_deps_);
   EXPECT_FALSE(edge->GetBindingBool("restat"));
 }
 
@@ -697,35 +838,35 @@ TEST_F(GraphTest, DyndepLoadMultiple) {
   EXPECT_FALSE(GetNode("dd")->dyndep_pending());
 
   Edge* edge1 = GetNode("out1")->in_edge();
-  ASSERT_EQ(2u, edge1->outputs_.size());
+  ASSERT_EQ(size_t(2), edge1->outputs_.size());
   EXPECT_EQ("out1", edge1->outputs_[0]->path());
   EXPECT_EQ("out1imp", edge1->outputs_[1]->path());
-  EXPECT_EQ(1u, edge1->implicit_outs_);
-  ASSERT_EQ(3u, edge1->inputs_.size());
+  EXPECT_EQ(1, edge1->implicit_outs_);
+  ASSERT_EQ(size_t(3), edge1->inputs_.size());
   EXPECT_EQ("in1", edge1->inputs_[0]->path());
   EXPECT_EQ("in1imp", edge1->inputs_[1]->path());
   EXPECT_EQ("dd", edge1->inputs_[2]->path());
-  EXPECT_EQ(1u, edge1->implicit_deps_);
-  EXPECT_EQ(1u, edge1->order_only_deps_);
+  EXPECT_EQ(1, edge1->implicit_deps_);
+  EXPECT_EQ(1, edge1->order_only_deps_);
   EXPECT_FALSE(edge1->GetBindingBool("restat"));
   EXPECT_EQ(edge1, GetNode("out1imp")->in_edge());
   Node* in1imp = GetNode("in1imp");
-  ASSERT_EQ(1u, in1imp->out_edges().size());
+  ASSERT_EQ(size_t(1), in1imp->out_edges().size());
   EXPECT_EQ(edge1, in1imp->out_edges()[0]);
 
   Edge* edge2 = GetNode("out2")->in_edge();
-  ASSERT_EQ(1u, edge2->outputs_.size());
+  ASSERT_EQ(size_t(1), edge2->outputs_.size());
   EXPECT_EQ("out2", edge2->outputs_[0]->path());
-  EXPECT_EQ(0u, edge2->implicit_outs_);
-  ASSERT_EQ(3u, edge2->inputs_.size());
+  EXPECT_EQ(0, edge2->implicit_outs_);
+  ASSERT_EQ(size_t(3), edge2->inputs_.size());
   EXPECT_EQ("in2", edge2->inputs_[0]->path());
   EXPECT_EQ("in2imp", edge2->inputs_[1]->path());
   EXPECT_EQ("dd", edge2->inputs_[2]->path());
-  EXPECT_EQ(1u, edge2->implicit_deps_);
-  EXPECT_EQ(1u, edge2->order_only_deps_);
+  EXPECT_EQ(1, edge2->implicit_deps_);
+  EXPECT_EQ(1, edge2->order_only_deps_);
   EXPECT_TRUE(edge2->GetBindingBool("restat"));
   Node* in2imp = GetNode("in2imp");
-  ASSERT_EQ(1u, in2imp->out_edges().size());
+  ASSERT_EQ(size_t(1), in2imp->out_edges().size());
   EXPECT_EQ(edge2, in2imp->out_edges()[0]);
 }
 
@@ -781,6 +922,72 @@ TEST_F(GraphTest, DyndepImplicitInputNewer) {
   EXPECT_FALSE(GetNode("dd")->dirty());
 
   // "out" is dirty due to dyndep-specified implicit input
+  EXPECT_TRUE(GetNode("out")->dirty());
+}
+
+TEST_F(GraphTest, DyndepOutputIsDependentInput) {
+  ASSERT_NO_FATAL_FAILURE(AssertParse(&state_,
+"rule r\n"
+"  command = unused\n"
+"build tmp: r in || dd\n"
+"  dyndep = dd\n"
+"build out: r | tmp.imp || tmp\n"
+));
+  fs_.Create("tmp", "");
+  fs_.Create("tmp.imp", "");
+  fs_.Create("out", "");
+  fs_.Create("dd",
+"ninja_dyndep_version = 1\n"
+"build tmp | tmp.imp: dyndep\n"
+);
+  fs_.Tick();
+  fs_.Create("in", "");
+
+  string err;
+  EXPECT_TRUE(scan_.RecomputeDirty(GetNode("out"), NULL, &err));
+  ASSERT_EQ("", err);
+
+  EXPECT_FALSE(GetNode("in")->dirty());
+  EXPECT_FALSE(GetNode("dd")->dirty());
+
+  EXPECT_TRUE(GetNode("tmp")->dirty());
+  EXPECT_TRUE(GetNode("tmp.imp")->dirty());
+
+  // "out" is dirty due to implicit dependency on dyndep-specified output
+  EXPECT_TRUE(GetNode("out")->dirty());
+}
+
+TEST_F(GraphTest, DyndepOutputIsDependentInputFromDepfile) {
+  ASSERT_NO_FATAL_FAILURE(AssertParse(&state_,
+"rule r\n"
+"  command = unused\n"
+"build tmp: r in || dd\n"
+"  dyndep = dd\n"
+"build out: r || tmp\n"
+"  depfile = out.d\n"
+));
+  fs_.Create("tmp", "");
+  fs_.Create("tmp.imp", "");
+  fs_.Create("out", "");
+  fs_.Create("out.d", "out: tmp.imp\n");
+  fs_.Create("dd",
+"ninja_dyndep_version = 1\n"
+"build tmp | tmp.imp: dyndep\n"
+);
+  fs_.Tick();
+  fs_.Create("in", "");
+
+  string err;
+  EXPECT_TRUE(scan_.RecomputeDirty(GetNode("out"), NULL, &err));
+  ASSERT_EQ("", err);
+
+  EXPECT_FALSE(GetNode("in")->dirty());
+  EXPECT_FALSE(GetNode("dd")->dirty());
+
+  EXPECT_TRUE(GetNode("tmp")->dirty());
+  EXPECT_TRUE(GetNode("tmp.imp")->dirty());
+
+  // "out" is dirty due to depfile dependency on dyndep-specified output
   EXPECT_TRUE(GetNode("out")->dirty());
 }
 
@@ -906,6 +1113,10 @@ TEST_F(GraphTest, DyndepFileCircular) {
 "ninja_dyndep_version = 1\n"
 "build out | circ: dyndep\n"
   );
+  fs_.Create("circ", "");
+  fs_.Tick();
+  fs_.Create("in", "");
+  fs_.Tick();
   fs_.Create("out", "");
 
   Edge* edge = GetNode("out")->in_edge();
@@ -913,14 +1124,13 @@ TEST_F(GraphTest, DyndepFileCircular) {
   EXPECT_FALSE(scan_.RecomputeDirty(GetNode("out"), NULL, &err));
   EXPECT_EQ("dependency cycle: circ -> in -> circ", err);
 
-  // Verify that "out.d" was loaded exactly once despite
-  // circular reference discovered from dyndep file.
-  ASSERT_EQ(3u, edge->inputs_.size());
+  // Verify that "out.d" was not loaded. Circular reference is discovered from
+  // dyndep file, before depsfile is loaded in the same edge.
+  ASSERT_EQ(size_t(2), edge->inputs_.size());
   EXPECT_EQ("in", edge->inputs_[0]->path());
-  EXPECT_EQ("inimp", edge->inputs_[1]->path());
-  EXPECT_EQ("dd", edge->inputs_[2]->path());
-  EXPECT_EQ(1u, edge->implicit_deps_);
-  EXPECT_EQ(1u, edge->order_only_deps_);
+  EXPECT_EQ("dd", edge->inputs_[1]->path());
+  EXPECT_EQ(0, edge->implicit_deps_);
+  EXPECT_EQ(1, edge->order_only_deps_);
 }
 
 TEST_F(GraphTest, Validation) {
@@ -934,7 +1144,7 @@ TEST_F(GraphTest, Validation) {
   EXPECT_TRUE(scan_.RecomputeDirty(GetNode("out"), &validation_nodes, &err));
   ASSERT_EQ("", err);
 
-  ASSERT_EQ(validation_nodes.size(), 1);
+  ASSERT_EQ(validation_nodes.size(), size_t(1));
   EXPECT_EQ(validation_nodes[0]->path(), "validate");
 
   EXPECT_TRUE(GetNode("out")->dirty());
@@ -976,4 +1186,72 @@ TEST_F(GraphTest, PhonyDepsMtimes) {
   EXPECT_GT(in1->mtime(), in1Mtime1);
   EXPECT_EQ(out1->mtime(), out1Mtime1);
   EXPECT_TRUE(out1->dirty());
+}
+
+// Test that EdgeQueue correctly prioritizes by critical time
+TEST_F(GraphTest, EdgeQueuePriority) {
+
+  ASSERT_NO_FATAL_FAILURE(AssertParse(&state_,
+"rule r\n"
+"  command = unused\n"
+"build out1: r in1\n"
+"build out2: r in2\n"
+"build out3: r in3\n"
+));
+
+  const int n_edges = 3;
+  Edge *(edges)[n_edges] = {
+    GetNode("out1")->in_edge(),
+    GetNode("out2")->in_edge(),
+    GetNode("out3")->in_edge(),
+  };
+
+  // Output is largest critical time to smallest
+  for (int i = 0; i < n_edges; ++i) {
+    edges[i]->set_critical_path_weight(i * 10);
+  }
+
+  EdgePriorityQueue queue;
+  for (int i = 0; i < n_edges; ++i) {
+    queue.push(edges[i]);
+  }
+
+  EXPECT_EQ(queue.size(), static_cast<size_t>(n_edges));
+  for (int i = 0; i < n_edges; ++i) {
+    EXPECT_EQ(queue.top(), edges[n_edges - 1 - i]);
+    queue.pop();
+  }
+  EXPECT_TRUE(queue.empty());
+
+  // When there is ambiguity, the lowest edge id comes first
+  for (int i = 0; i < n_edges; ++i) {
+    edges[i]->set_critical_path_weight(0);
+  }
+
+  queue.push(edges[1]);
+  queue.push(edges[2]);
+  queue.push(edges[0]);
+
+  for (int i = 0; i < n_edges; ++i) {
+    EXPECT_EQ(queue.top(), edges[i]);
+    queue.pop();
+  }
+  EXPECT_TRUE(queue.empty());
+}
+
+TEST_F(GraphTest, PhonyOutputWithValidation) {
+  ASSERT_NO_FATAL_FAILURE(AssertParse(&state_,
+                                      "build valid: phony\n"
+                                      "build out: phony |@ valid\n"));
+  fs_.Create("valid", "");
+
+  string err;
+  std::vector<Node*> validation_nodes;
+  EXPECT_TRUE(scan_.RecomputeDirty(GetNode("out"), &validation_nodes, &err));
+  ASSERT_EQ("", err);
+
+  // Phony output with validation should not be dirty even if output is missing.
+  EXPECT_FALSE(GetNode("out")->dirty());
+  ASSERT_EQ(1u, validation_nodes.size());
+  EXPECT_EQ("valid", validation_nodes[0]->path());
 }

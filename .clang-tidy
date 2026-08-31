@@ -6,6 +6,8 @@ Checks: '
   ,readability-redundant-string-cstr,
   ,readability-redundant-string-init,
   ,readability-simplify-boolean-expr,
+  ,cppcoreguidelines-pro-type-cstyle-cast,
+  ,bugprone-assignment-in-if-condition,
 '
 WarningsAsErrors: '
   ,readability-avoid-const-params-in-decls,
@@ -14,4 +16,6 @@ WarningsAsErrors: '
   ,readability-redundant-string-cstr,
   ,readability-redundant-string-init,
   ,readability-simplify-boolean-expr,
+  ,cppcoreguidelines-pro-type-cstyle-cast,
+  ,bugprone-assignment-in-if-condition,
 '

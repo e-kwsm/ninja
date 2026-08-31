@@ -18,8 +18,8 @@
 
 using namespace std;
 
-string BindingEnv::LookupVariable(const string& var) {
-  map<string, string>::iterator i = bindings_.find(var);
+std::string BindingEnv::LookupVariable(StringPiece var) {
+  const auto i = bindings_.find(var);
   if (i != bindings_.end())
     return i->second;
   if (parent_)
@@ -27,26 +27,26 @@ string BindingEnv::LookupVariable(const string& var) {
   return "";
 }
 
-void BindingEnv::AddBinding(const string& key, const string& val) {
-  bindings_[key] = val;
+void BindingEnv::AddBinding(const std::string& key, StringPiece val) {
+  bindings_[key].assign(val.begin(), val.end());
 }
 
-void BindingEnv::AddRule(const Rule* rule) {
+void BindingEnv::AddRule(std::unique_ptr<const Rule> rule) {
   assert(LookupRuleCurrentScope(rule->name()) == NULL);
-  rules_[rule->name()] = rule;
+  rules_[rule->name()] = std::move(rule);
 }
 
-const Rule* BindingEnv::LookupRuleCurrentScope(const string& rule_name) {
-  map<string, const Rule*>::iterator i = rules_.find(rule_name);
+const Rule* BindingEnv::LookupRuleCurrentScope(StringPiece rule_name) {
+  auto i = rules_.find(rule_name);
   if (i == rules_.end())
     return NULL;
-  return i->second;
+  return i->second.get();
 }
 
-const Rule* BindingEnv::LookupRule(const string& rule_name) {
-  map<string, const Rule*>::iterator i = rules_.find(rule_name);
+const Rule* BindingEnv::LookupRule(StringPiece rule_name) {
+  auto i = rules_.find(rule_name);
   if (i != rules_.end())
-    return i->second;
+    return i->second.get();
   if (parent_)
     return parent_->LookupRule(rule_name);
   return NULL;
@@ -56,15 +56,25 @@ void Rule::AddBinding(const string& key, const EvalString& val) {
   bindings_[key] = val;
 }
 
-const EvalString* Rule::GetBinding(const string& key) const {
+const EvalString* Rule::GetBinding(StringPiece key) const {
   Bindings::const_iterator i = bindings_.find(key);
   if (i == bindings_.end())
     return NULL;
   return &i->second;
 }
 
+std::unique_ptr<Rule> Rule::Phony() {
+  auto rule = std::unique_ptr<Rule>(new Rule("phony"));
+  rule->phony_ = true;
+  return rule;
+}
+
+bool Rule::IsPhony() const {
+  return phony_;
+}
+
 // static
-bool Rule::IsReservedBinding(const string& var) {
+bool Rule::IsReservedBinding(StringPiece var) {
   return var == "command" ||
       var == "depfile" ||
       var == "dyndep" ||
@@ -78,14 +88,14 @@ bool Rule::IsReservedBinding(const string& var) {
       var == "msvc_deps_prefix";
 }
 
-const map<string, const Rule*>& BindingEnv::GetRules() const {
+const map<string, std::unique_ptr<const Rule>, StringPieceLess>& BindingEnv::GetRules() const {
   return rules_;
 }
 
-string BindingEnv::LookupWithFallback(const string& var,
-                                      const EvalString* eval,
-                                      Env* env) {
-  map<string, string>::iterator i = bindings_.find(var);
+std::string BindingEnv::LookupWithFallback(StringPiece var,
+                                           const EvalString* eval,
+                                           Env* env) {
+  const auto i = bindings_.find(var);
   if (i != bindings_.end())
     return i->second;
 
@@ -99,6 +109,10 @@ string BindingEnv::LookupWithFallback(const string& var,
 }
 
 string EvalString::Evaluate(Env* env) const {
+  if (parsed_.empty()) {
+    return single_token_;
+  }
+
   string result;
   for (TokenList::const_iterator i = parsed_.begin(); i != parsed_.end(); ++i) {
     if (i->second == RAW)
@@ -110,40 +124,57 @@ string EvalString::Evaluate(Env* env) const {
 }
 
 void EvalString::AddText(StringPiece text) {
-  // Add it to the end of an existing RAW token if possible.
-  if (!parsed_.empty() && parsed_.back().second == RAW) {
-    parsed_.back().first.append(text.str_, text.len_);
+  if (parsed_.empty()) {
+    single_token_.append(text.begin(), text.end());
+  } else if (!parsed_.empty() && parsed_.back().second == RAW) {
+    parsed_.back().first.append(text.begin(), text.end());
   } else {
-    parsed_.push_back(make_pair(text.AsString(), RAW));
+    parsed_.push_back(std::make_pair(text.AsString(), RAW));
   }
 }
+
 void EvalString::AddSpecial(StringPiece text) {
-  parsed_.push_back(make_pair(text.AsString(), SPECIAL));
+  if (parsed_.empty() && !single_token_.empty()) {
+    // Going from one to two tokens, so we can no longer apply
+    // our single_token_ optimization and need to push everything
+    // onto the vector.
+    parsed_.push_back(std::make_pair(std::move(single_token_), RAW));
+  }
+  parsed_.push_back(std::make_pair(text.AsString(), SPECIAL));
 }
 
 string EvalString::Serialize() const {
   string result;
-  for (TokenList::const_iterator i = parsed_.begin();
-       i != parsed_.end(); ++i) {
+  if (parsed_.empty() && !single_token_.empty()) {
     result.append("[");
-    if (i->second == SPECIAL)
-      result.append("$");
-    result.append(i->first);
+    result.append(single_token_);
     result.append("]");
+  } else {
+    for (const auto& pair : parsed_) {
+      result.append("[");
+      if (pair.second == SPECIAL)
+        result.append("$");
+      result.append(pair.first.begin(), pair.first.end());
+      result.append("]");
+    }
   }
   return result;
 }
 
 string EvalString::Unparse() const {
   string result;
-  for (TokenList::const_iterator i = parsed_.begin();
-       i != parsed_.end(); ++i) {
-    bool special = (i->second == SPECIAL);
-    if (special)
-      result.append("${");
-    result.append(i->first);
-    if (special)
-      result.append("}");
+  if (parsed_.empty() && !single_token_.empty()) {
+    result.append(single_token_.begin(), single_token_.end());
+  } else {
+    for (TokenList::const_iterator i = parsed_.begin();
+         i != parsed_.end(); ++i) {
+      bool special = (i->second == SPECIAL);
+      if (special)
+        result.append("${");
+      result.append(i->first.begin(), i->first.end());
+      if (special)
+        result.append("}");
+    }
   }
   return result;
 }

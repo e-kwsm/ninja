@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include "exit_status.h"
 #include "subprocess.h"
 
 #include <assert.h>
@@ -198,9 +199,8 @@ ExitStatus Subprocess::Finish() {
   CloseHandle(child_);
   child_ = NULL;
 
-  return exit_code == 0              ? ExitSuccess :
-         exit_code == CONTROL_C_EXIT ? ExitInterrupted :
-                                       ExitFailure;
+  return exit_code == CONTROL_C_EXIT ? ExitInterrupted :
+                                       static_cast<ExitStatus>(exit_code);
 }
 
 bool Subprocess::Done() const {
@@ -251,10 +251,11 @@ Subprocess *SubprocessSet::Add(const string& command, bool use_console) {
   return subprocess;
 }
 
-bool SubprocessSet::DoWork() {
+SubprocessSet::WorkResult SubprocessSet::DoWork() {
   DWORD bytes_read;
   Subprocess* subproc;
   OVERLAPPED* overlapped;
+  WorkResult work_result = WorkResult::NoWork;
 
   if (!GetQueuedCompletionStatus(ioport_, &bytes_read, (PULONG_PTR)&subproc,
                                  &overlapped, INFINITE)) {
@@ -264,7 +265,7 @@ bool SubprocessSet::DoWork() {
 
   if (!subproc) // A NULL subproc indicates that we were interrupted and is
                 // delivered by NotifyInterrupted above.
-    return true;
+    return WorkResult::Interrupted;
 
   subproc->OnPipeReady();
 
@@ -274,10 +275,11 @@ bool SubprocessSet::DoWork() {
     if (running_.end() != end) {
       finished_.push(subproc);
       running_.resize(end - running_.begin());
+      work_result = WorkResult::SubprocFinished;
     }
   }
 
-  return false;
+  return work_result;
 }
 
 Subprocess* SubprocessSet::NextFinished() {

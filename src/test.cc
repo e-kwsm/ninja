@@ -47,8 +47,8 @@ using namespace std;
 
 namespace {
 
-#ifdef _WIN32
-/// Windows has no mkdtemp.  Implement it in terms of _mktemp_s.
+#ifdef _MSC_VER
+/// MSVC has no mkdtemp.  Implement it in terms of _mktemp_s.
 char* mkdtemp(char* name_template) {
   int err = _mktemp_s(name_template, strlen(name_template) + 1);
   if (err < 0) {
@@ -64,7 +64,7 @@ char* mkdtemp(char* name_template) {
 
   return name_template;
 }
-#endif  // _WIN32
+#endif  // _MSC_VER
 
 string GetSystemTempDir() {
 #ifdef _WIN32
@@ -152,13 +152,18 @@ void VirtualFileSystem::Create(const string& path,
 TimeStamp VirtualFileSystem::Stat(const string& path, string* err) const {
   FileMap::const_iterator i = files_.find(path);
   if (i != files_.end()) {
-    *err = i->second.stat_error;
+    if (!i->second.stat_error.empty()) {
+      *err = i->second.stat_error;
+      return -1;
+    }
+    assert(i->second.mtime > 0);
     return i->second.mtime;
   }
   return 0;
 }
 
-bool VirtualFileSystem::WriteFile(const string& path, const string& contents) {
+bool VirtualFileSystem::WriteFile(const string& path, const string& contents,
+                                  bool /*crlf_on_windows*/) {
   Create(path, contents);
   return true;
 }
@@ -234,4 +239,30 @@ void ScopedTempDir::Cleanup() {
     Fatal("system: %s", strerror(errno));
 
   temp_dir_name_.clear();
+}
+
+ScopedFilePath::ScopedFilePath(ScopedFilePath&& other) noexcept
+    : path_(std::move(other.path_)), released_(other.released_) {
+  other.released_ = true;
+}
+
+/// It would be nice to use '= default' here instead but some old compilers
+/// such as GCC from Ubuntu 16.06 will not compile it with "noexcept", so just
+/// write it manually.
+ScopedFilePath& ScopedFilePath::operator=(ScopedFilePath&& other) noexcept {
+  if (this != &other) {
+    this->~ScopedFilePath();
+    new (this) ScopedFilePath(std::move(other));
+  }
+  return *this;
+}
+
+ScopedFilePath::~ScopedFilePath() {
+  if (!released_) {
+    platformAwareUnlink(path_.c_str());
+  }
+}
+
+void ScopedFilePath::Release() {
+  released_ = true;
 }

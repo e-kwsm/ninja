@@ -18,19 +18,22 @@
 #include <cstdio>
 #include <map>
 #include <memory>
-#include <queue>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
+#include "build_result.h"
 #include "depfile_parser.h"
-#include "graph.h"  // XXX needed for DependencyScan; should rearrange.
 #include "exit_status.h"
+#include "graph.h"
+#include "jobserver.h"
 #include "util.h"  // int64_t
 
 struct BuildLog;
 struct Builder;
 struct DiskInterface;
 struct Edge;
+struct Explanations;
 struct Node;
 struct State;
 struct Status;
@@ -51,6 +54,9 @@ struct Plan {
 
   /// Returns true if there's more work to be done.
   bool more_to_do() const { return wanted_edges_ > 0 && command_edges_ > 0; }
+
+  /// Returns true if there's more work ready to be done.
+  bool work_ready() const { return !ready_.empty(); }
 
   /// Dumps the current state of the plan.
   void Dump() const;
@@ -76,21 +82,15 @@ struct Plan {
   /// Reset state.  Clears want and ready sets.
   void Reset();
 
-  /// Update the build plan to account for modifications made to the graph
-  /// by information loaded from a dyndep file.
-  bool DyndepsLoaded(DependencyScan* scan, const Node* node,
-                     const DyndepFile& ddf, std::string* err);
-private:
-  bool RefreshDyndepDependents(DependencyScan* scan, const Node* node, std::string* err);
-  void UnmarkDependents(const Node* node, std::set<Node*>* dependents);
-  bool AddSubTarget(const Node* node, const Node* dependent, std::string* err,
-                    std::set<Edge*>* dyndep_walk);
+  // After all targets have been added, prepares the ready queue for find work.
+  void PrepareQueue();
 
-  /// Update plan with knowledge that the given node is up to date.
-  /// If the node is a dyndep binding on any of its dependents, this
-  /// loads dynamic dependencies from the node's path.
-  /// Returns 'false' if loading dyndep info fails and 'true' otherwise.
-  bool NodeFinished(Node* node, std::string* err);
+  /// Update the build plan to account for modifications made to the graph
+  /// by information loaded from a set of dyndep files.
+  bool DyndepsLoaded(DependencyScan* scan,
+                     const std::vector<Node*>& dyndep_nodes,
+                     const std::unordered_map<Edge*, Dyndeps>& dyndep_edges,
+                     std::string* err);
 
   /// Enumerate possible steps we want for an edge.
   enum Want
@@ -104,6 +104,25 @@ private:
     /// for it to complete.
     kWantToFinish
   };
+
+ private:
+  void ComputeCriticalPath();
+  bool RefreshDyndepDependents(DependencyScan* scan,
+                               const std::vector<Node*>& dyndep_nodes,
+                               std::string* err);
+  void UnmarkDependents(const Node* node, std::set<Node*>* dependents);
+  bool AddSubTarget(const Node* node, const Node* dependent, std::string* err,
+                    std::set<Edge*>* dyndep_walk);
+
+  // Add edges that kWantToStart into the ready queue
+  // Must be called after ComputeCriticalPath and before FindWork
+  void ScheduleInitialEdges();
+
+  /// Update plan with knowledge that the given node is up to date.
+  /// If the node is a dyndep binding on any of its dependents, this
+  /// loads dynamic dependencies from the node's path.
+  /// Returns 'false' if loading dyndep info fails and 'true' otherwise.
+  bool NodeFinished(Node* node, std::string* err);
 
   void EdgeWanted(const Edge* edge);
   bool EdgeMaybeReady(std::map<Edge*, Want>::iterator want_e, std::string* err);
@@ -119,9 +138,11 @@ private:
   /// we want for the edge.
   std::map<Edge*, Want> want_;
 
-  EdgeSet ready_;
+  EdgePriorityQueue ready_;
 
   Builder* builder_;
+  /// user provided targets in build order, earlier one have higher priority
+  std::vector<const Node*> targets_;
 
   /// Total number of edges that have commands (not phony).
   int command_edges_;
@@ -130,33 +151,39 @@ private:
   int wanted_edges_;
 };
 
+struct BuildConfig;
+
 /// CommandRunner is an interface that wraps running the build
 /// subcommands.  This allows tests to abstract out running commands.
 /// RealCommandRunner is an implementation that actually runs commands.
 struct CommandRunner {
   virtual ~CommandRunner() {}
-  virtual bool CanRunMore() const = 0;
+  virtual size_t CanRunMore() const = 0;
   virtual bool StartCommand(Edge* edge) = 0;
 
-  /// The result of waiting for a command.
-  struct Result {
-    Result() : edge(NULL) {}
-    Edge* edge;
-    ExitStatus status;
-    std::string output;
-    bool success() const { return status == ExitSuccess; }
-  };
   /// Wait for a command to complete, or return false if interrupted.
-  virtual bool WaitForCommand(Result* result) = 0;
+  virtual BuildResult WaitForCommand() = 0;
+
+  /// Wait for a command to complete or a jobserver token to become available, or
+  /// return false if interrupted. Default implementation waits for a command to complete.
+  /// Overridden by RealCommandRunner to also wait for jobserver tokens.
+  virtual BuildResult WaitForCommandOrJobserverToken(bool watch_jobserver) {
+    (void)watch_jobserver;
+    return WaitForCommand();
+  }
 
   virtual std::vector<Edge*> GetActiveEdges() { return std::vector<Edge*>(); }
   virtual void Abort() {}
+
+  /// Creates the RealCommandRunner. \arg jobserver can be nullptr if there
+  /// is no jobserver pool to use.
+  static CommandRunner* factory(const BuildConfig& config,
+                                Jobserver::Client* jobserver);
 };
 
 /// Options (e.g. verbosity, parallelism) passed to a build.
 struct BuildConfig {
-  BuildConfig() : verbosity(NORMAL), dry_run(false), parallelism(1),
-                  failures_allowed(1), max_load_average(-0.0f) {}
+  BuildConfig() = default;
 
   enum Verbosity {
     QUIET,  // No output -- used when testing.
@@ -164,23 +191,31 @@ struct BuildConfig {
     NORMAL,  // regular output and status update
     VERBOSE
   };
-  Verbosity verbosity;
-  bool dry_run;
-  int parallelism;
-  int failures_allowed;
+  Verbosity verbosity = NORMAL;
+  bool dry_run = false;
+  int parallelism = 1;
+  bool disable_jobserver_client = false;
+  int failures_allowed = 1;
   /// The maximum load average we must not exceed. A negative value
   /// means that we do not have any limit.
-  double max_load_average;
+  double max_load_average = -0.0f;
+  /// Progress status format, as set by --status. Overrides $NINJA_STATUS
+  /// when non-null.
+  const char* progress_status_format = nullptr;
   DepfileParserOptions depfile_parser_options;
 };
 
 /// Builder wraps the build process: starting commands, updating status.
 struct Builder {
-  Builder(State* state, const BuildConfig& config,
-          BuildLog* build_log, DepsLog* deps_log,
-          DiskInterface* disk_interface, Status* status,
+  Builder(State* state, const BuildConfig& config, BuildLog* build_log,
+          DepsLog* deps_log, DiskInterface* disk_interface, Status* status,
           int64_t start_time_millis);
   ~Builder();
+
+  /// Set Jobserver client instance for this builder.
+  void SetJobserverClient(std::unique_ptr<Jobserver::Client> jobserver_client) {
+    jobserver_ = std::move(jobserver_client);
+  }
 
   /// Clean up after interrupted commands by deleting output files.
   void Cleanup();
@@ -194,37 +229,42 @@ struct Builder {
   /// Returns true if the build targets are already up to date.
   bool AlreadyUpToDate() const;
 
-  /// Run the build.  Returns false on error.
+  /// Run the build.  Returns ExitStatus or the exit code of the last failed job.
   /// It is an error to call this function when AlreadyUpToDate() is true.
-  bool Build(std::string* err);
+  ExitStatus Build(std::string* err);
 
   bool StartEdge(Edge* edge, std::string* err);
 
   /// Update status ninja logs following a command termination.
   /// @return false if the build can not proceed further due to a fatal error.
-  bool FinishCommand(CommandRunner::Result* result, std::string* err);
+  bool FinishCommand(BuildResult::CommandCompleted& result, std::string* err);
 
   /// Used for tests.
   void SetBuildLog(BuildLog* log) {
     scan_.set_build_log(log);
   }
 
-  /// Load the dyndep information provided by the given node.
-  bool LoadDyndeps(Node* node, std::string* err);
+  /// Load the dyndep information provided by the given edge's outputs.
+  bool LoadDyndeps(Edge* edge, std::string* err);
 
   State* state_;
   const BuildConfig& config_;
   Plan plan_;
-#if __cplusplus < 201703L
-  std::auto_ptr<CommandRunner> command_runner_;
-#else
-  std::unique_ptr<CommandRunner> command_runner_;  // auto_ptr was removed in C++17.
-#endif
+  std::unique_ptr<Jobserver::Client> jobserver_;
+  std::unique_ptr<CommandRunner> command_runner_;
   Status* status_;
 
- private:
-  bool ExtractDeps(CommandRunner::Result* result, const std::string& deps_type,
-                   const std::string& deps_prefix,
+  /// Returns ExitStatus or the exit code of the last failed job
+  /// (doesn't need to be an enum value of ExitStatus)
+  ExitStatus GetExitCode() const { return exit_code_; }
+
+private:
+  /// Parses the CommandCompleted result to extract dependencies.
+  /// May modify result.output to extract dependency messages out of it
+  /// (such as MSVC /showIncludes).
+  /// @return true if successful, false otherwise.
+  bool ExtractDeps(BuildResult::CommandCompleted& result,
+                   const std::string& deps_type, const std::string& deps_prefix,
                    std::vector<Node*>* deps_nodes, std::string* err);
 
   /// Map of running edge to time the edge started running.
@@ -234,8 +274,17 @@ struct Builder {
   /// Time the build started.
   int64_t start_time_millis_;
 
+  std::string lock_file_path_;
   DiskInterface* disk_interface_;
+
+  // Only create an Explanations class if '-d explain' is used.
+  std::unique_ptr<Explanations> explanations_;
+
   DependencyScan scan_;
+
+  /// Keep the global exit code for the build
+  ExitStatus exit_code_ = ExitSuccess;
+  void SetFailureCode(ExitStatus code);
 
   // Unimplemented copy ctor and operator= ensure we don't copy the auto_ptr.
   Builder(const Builder &other);        // DO NOT IMPLEMENT
